@@ -1,0 +1,47 @@
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+
+const ToastCtx = createContext<(m: string) => void>(() => {});
+export function ToastProvider({ children }: { children: ReactNode }) {
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => { if (!msg) return; const t = setTimeout(() => setMsg(null), 2800); return () => clearTimeout(t); }, [msg]);
+  return <ToastCtx.Provider value={setMsg}>{children}{msg && <div className="toast" role="status" aria-live="polite">{msg}</div>}</ToastCtx.Provider>;
+}
+export const useToast = () => useContext(ToastCtx);
+
+export function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, [string, string]> = { active: ["●", "Active"], disabled: ["⏸", "Disabled"], archived: ["▣", "Archived"], deletion_pending: ["⌫", "Deletion pending"], draft: ["○", "Draft"] };
+  const [icon, label] = map[status] || ["?", status];
+  return <span className={"status " + status}><span aria-hidden="true">{icon}</span>{label}</span>;
+}
+
+export function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+  useEffect(() => { const k = (e: KeyboardEvent) => e.key === "Escape" && onClose(); window.addEventListener("keydown", k); return () => window.removeEventListener("keydown", k); }, [onClose]);
+  return <div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="card stack"><h2>{title}</h2>{children}</div></div>;
+}
+
+export function Confirm({ title, body, confirmLabel, danger, onConfirm, onClose }: { title: string; body: ReactNode; confirmLabel: string; danger?: boolean; onConfirm: () => void | Promise<void>; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+  return <Modal title={title} onClose={onClose}>
+    <div>{body}</div>
+    <div className="row"><button className={"btn " + (danger ? "danger" : "pri")} disabled={busy} autoFocus onClick={async () => { setBusy(true); try { await onConfirm(); } finally { setBusy(false); onClose(); } }}>{confirmLabel}</button>
+      <button className="btn" onClick={onClose}>Cancel</button></div>
+  </Modal>;
+}
+
+export function ErrorNote({ error }: { error: string | null }) { return error ? <div className="notice bad" role="alert">{error}</div> : null; }
+export function Loading({ label = "Loading…" }: { label?: string }) { return <div className="small" role="status">{label}</div>; }
+
+export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]) {
+  const [data, setData] = useState<T | null>(null); const [error, setError] = useState<string | null>(null); const [loading, setLoading] = useState(true);
+  const [tick, setTick] = useState(0);
+  useEffect(() => { let on = true; setLoading(true); fn().then((d) => { if (on) { setData(d); setError(null); } }).catch((e) => on && setError(e.message)).finally(() => on && setLoading(false)); return () => { on = false; }; }, [...deps, tick]);
+  return { data, error, loading, reload: () => setTick((t) => t + 1), setData };
+}
+
+export async function copy(text: string, toast: (m: string) => void) {
+  try { await navigator.clipboard.writeText(text); toast("Copied"); } catch { toast("Couldn't copy — select and copy manually"); }
+}
+export function download(filename: string, data: BlobPart, type: string) {
+  const url = URL.createObjectURL(new Blob([data], { type })); const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000);
+}

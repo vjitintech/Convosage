@@ -1,0 +1,52 @@
+:root{--bg:#f5f3ec;--panel:#fffdf8;--ink:#1c2420;--muted:#56625b;--line:#e2ded2;--sage:#3d6b55;--sage-d:#2b4f3e;--sage-l:#e2ece5;--amber:#8a5a0f;--amber-l:#f7ecd8;--red:#a32f2f;--red-l:#f6e1df;--blue:#2a557f;--blue-l:#e2ebf4;--r:10px;--mono:ui-monospace,"Cascadia Mono",Consolas,monospace}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "Segoe UI Variable","Segoe UI",-apple-system,BlinkMacSystemFont,Inter,system-ui,sans-serif}
+button,input,textarea,select{font:inherit;color:inherit}
+:focus-visible{outline:3px solid #1d4ed8;outline-offset:2px}
+h1,h2,h3{margin:0;line-height:1.25}h2{font-size:16px}h3{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.app{min-height:100vh;display:flex;flex-direction:column}
+.top{position:sticky;top:0;z-index:5;background:rgba(245,243,236,.96);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;align-items:center;gap:8px}
+.brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px}.brand img{width:22px;height:22px}
+.main{padding:12px;display:flex;flex-direction:column;gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px}
+.stack>*+*{margin-top:10px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sp{flex:1}
+.small{font-size:12.5px;color:var(--muted)}.mono{font-family:var(--mono);font-size:12px}
+label.f{display:block;font-size:12.5px;font-weight:600;color:var(--muted);margin-bottom:3px}
+input[type=text],input[type=tel],input[type=password],input[type=number],textarea,select{width:100%;border:1px solid #cfcabd;background:#fff;border-radius:8px;padding:8px 10px}
+textarea{resize:vertical;min-height:64px}
+.btn{border:1px solid #cfcabd;background:#fff;border-radius:8px;padding:6px 11px;font-weight:600;cursor:pointer;display:inline-flex;gap:6px;align-items:center;font-size:13px}
+.btn:hover{border-color:#a8a293}.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.pri{background:var(--sage);border-color:var(--sage);color:#fff}.btn.pri:hover{background:var(--sage-d)}
+.btn.danger{color:var(--red);border-color:#e1b4b0}.btn.dark{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.ghost{background:none;border-color:transparent;color:var(--muted)}.btn.sm{padding:3px 8px;font-size:12px}
+.status{display:inline-flex;align-items:center;gap:5px;font-weight:700;font-size:12px;border-radius:999px;padding:2px 9px;border:1px solid}
+.status.active{color:var(--sage-d);background:var(--sage-l);border-color:#b7cfbf}.status.disabled{color:var(--amber);background:var(--amber-l);border-color:#e6cd9e}
+.status.archived,.status.deletion_pending{color:#4b5563;background:#eef0f2;border-color:#d1d5db}
+.rec{display:inline-flex;align-items:center;gap:6px;font-weight:700;color:var(--red);background:var(--red-l);border:1px solid #e1b4b0;border-radius:999px;padding:2px 10px;font-size:12px}
+.rec i{width:8px;height:8px;border-radius:50%;background:var(--red);animation:p 1.2s infinite}@keyframes p{50%{opacity:.25}}
+.paused{color:var(--amber);background:var(--amber-l);border-color:#e6cd9e}.paused i{background:var(--amber);animation:none}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);overflow-x:auto}.tabs button{border:0;background:none;padding:8px 10px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.list{display:flex;flex-direction:column;gap:6px}
+.item{display:flex;align-items:center;gap:8px;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;text-align:left;width:100%}
+.item:hover{border-color:#b9b3a4}
+.q{border:1px solid var(--line);border-left:4px solid var(--sage);border-radius:9px;padding:10px;background:#fff}
+.q.critical{border-left-color:var(--red)}.q.high{border-left-color:#c27c0e}.q.low{border-left-color:#9aa59f}
+.qt{font-weight:600;font-size:14.5px;line-height:1.35}
+.tag{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 6px;border-radius:5px;background:#efede6;color:var(--muted)}
+.tag.critical{background:var(--red-l);color:var(--red)}.tag.high{background:var(--amber-l);color:var(--amber)}
+.ev{margin-top:6px;font-size:12.5px;background:#f6f4ee;border-radius:7px;padding:6px 8px}
+.ans{margin-top:6px;border:1px dashed #b7cfbf;background:#f3f8f4;border-radius:7px;padding:6px 8px;font-size:13px}
+.seg{display:grid;grid-template-columns:58px 1fr;gap:6px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:13px}
+.seg .t{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.scroll{max-height:300px;overflow:auto}
+.notice{border-radius:8px;padding:8px 10px;font-size:13px;background:var(--blue-l);color:#1d3d5c}.notice.warn{background:var(--amber-l);color:#5c3c07}.notice.bad{background:var(--red-l);color:#6e2121}.notice.ok{background:var(--sage-l);color:var(--sage-d)}
+.modal{position:fixed;inset:0;background:rgba(20,26,23,.45);display:flex;align-items:center;justify-content:center;padding:14px;z-index:20}
+.modal .card{max-width:420px;width:100%;max-height:90vh;overflow:auto}
+.toast{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:8px 14px;border-radius:999px;font-size:13px;z-index:30;max-width:92vw;text-align:center}
+.chk{display:flex;gap:8px;align-items:flex-start;font-size:13.5px;cursor:pointer}.chk input{margin-top:3px;width:16px;height:16px;accent-color:var(--sage)}
+.otp{letter-spacing:.4em;font-family:var(--mono);font-size:18px;text-align:center}
+.empty{padding:16px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:8px;font-size:13px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:4px 8px;font-size:13px}
+.prov{font-size:11px;font-weight:700;border-radius:4px;padding:1px 5px;margin-left:4px}.prov.user{background:var(--blue-l);color:var(--blue)}.prov.ai{background:var(--amber-l);color:var(--amber)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}

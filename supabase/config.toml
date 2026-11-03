@@ -1,0 +1,45 @@
+# CONVOSAGE AI — Supabase project configuration.
+# Local: `supabase start`. Hosted: `supabase link --project-ref <ref>` then `supabase config push` (auth settings)
+# and `supabase db push` (migrations). See docs/DEPLOYMENT.md.
+project_id = "convosage-ai"
+
+[api]
+# Only the default public schemas are exposed by the REST API. Application data lives in schema "app" (never exposed).
+schemas = ["public", "graphql_public"]
+
+[auth]
+enabled = true
+site_url = "https://vjitintech.github.io/Convosage/"
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+
+[auth.rate_limit]
+sms_sent = 30            # per hour, project-wide; raise after launch
+token_verifications = 30 # per 5 minutes per IP
+
+[auth.sms]
+enable_signup = true
+enable_confirmations = false
+max_frequency = "60s"
+template = "Your CONVOSAGE AI code is {{ .Code }}"
+
+# Twilio Verify sends OTP SMS to most countries. India: Twilio requires DLT-registered sender/templates under your company.
+[auth.sms.twilio_verify]
+enabled = true
+account_sid = "env(TWILIO_ACCOUNT_SID)"
+message_service_sid = "env(TWILIO_VERIFY_SERVICE_SID)"
+auth_token = "env(TWILIO_AUTH_TOKEN)"
+
+# Dummy login IDs for testing the production build: these numbers never receive SMS; use the fixed codes.
+# Remove before public launch (and set SHOW_TEST_ACCOUNTS=false in extension/src/config.ts).
+[auth.sms.test_otp]
+919999900001 = "123456"
+15550100002 = "654321"
+
+[functions.api]
+verify_jwt = false        # the function verifies Supabase JWTs itself (JWKS + legacy HS256) and must answer CORS preflight
+
+[functions.razorpay-webhook]
+verify_jwt = false        # Razorpay signs requests with HMAC (RAZORPAY_WEBHOOK_SECRET) instead
