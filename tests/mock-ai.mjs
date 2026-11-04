@@ -8,8 +8,23 @@ http.createServer((req, res) => {
     let send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
     if (req.url.includes("/audio/transcriptions")) return send({ text: "The nightly claims batch restarts from the top when CLMV0200 abends.", duration: 10, segments: [{ start: 0.5, end: 4.2, text: "The nightly claims batch restarts from the top", avg_logprob: -0.1, no_speech_prob: 0.01 }, { start: 4.2, end: 9.8, text: "when CLMV0200 abends. Contact ops at ops@example.com.", avg_logprob: -0.2, no_speech_prob: 0.02 }] });
     let body = JSON.parse(raw.toString() || "{}");
+    // Native Gemini generateContent (MODEL_PROVIDER=gemini): x-goog-api-key, contents/parts in, candidates out.
+    if (req.url.includes(":generateContent")) {
+      if ((req.headers["x-goog-api-key"] || "") === "bad-key") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } })); }
+      const conv = (body.contents || []).map((c) => ({ role: c.role === "model" ? "assistant" : "user", content: (c.parts || []).some((p) => p.functionResponse) ? [{ type: "tool_result", content: "x" }]
+        : (c.parts || []).some((p) => p.inlineData) ? (c.parts || []).map((p) => p.inlineData ? { type: "image" } : { type: "text", text: p.text || "" }) : (c.parts || []).map((p) => p.text || "").join("") }));
+      const tools = ((body.tools || [])[0]?.functionDeclarations || []).map((f) => ({ name: f.name }));
+      const plain = send;
+      send = (o) => {
+        const tu = (o.content || []).filter((c) => c.type === "tool_use");
+        const parts = tu.length ? tu.map((t) => ({ functionCall: { name: t.name, args: t.input } })) : [{ text: "thinking…", thought: true }, { text: (o.content || []).map((c) => c.text || "").join("") }];
+        return plain({ candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }] });
+      };
+      body = { messages: conv, tools };
+    }
     // OpenAI-compatible endpoint (as used with Gemini): adapt to the same scripted behaviour, reply in OpenAI shape.
     if (req.url.includes("/chat/completions")) {
+      if ((req.headers.authorization || "").startsWith("Bearer AQ.")) { res.writeHead(401, { "content-type": "application/json" }); return res.end(JSON.stringify([{ error: { code: 401, message: "Request had invalid authentication credentials.", status: "UNAUTHENTICATED", details: [{ reason: "ACCESS_TOKEN_TYPE_UNSUPPORTED" }] } }])); }
       if ((req.headers.authorization || "") === "Bearer bad-key") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify([{ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } }])); }
       const conv = (body.messages || []).filter((m) => m.role !== "system").map((m) => m.role === "tool" ? { role: "user", content: [{ type: "tool_result", content: m.content }] }
         : { role: m.role, content: Array.isArray(m.content) ? m.content.map((c) => c.type === "image_url" ? { type: "image" } : c) : m.content });

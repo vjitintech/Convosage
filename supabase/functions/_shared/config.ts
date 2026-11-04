@@ -17,8 +17,9 @@ export const config = {
   allowedOrigins: list("ALLOWED_ORIGINS"), // e.g. chrome-extension://abcdefghijklmnop ; empty = any extension origin
 
   // Model gateway (replaceable providers)
-  modelProvider: env("MODEL_PROVIDER", "anthropic") as "anthropic" | "openai",
-  modelBaseUrl: env("MODEL_BASE_URL", "https://api.anthropic.com"),
+  // "gemini" = Google's native Gemini API (works with the new AQ.… keys); "openai" = any OpenAI-compatible endpoint.
+  modelProvider: env("MODEL_PROVIDER", "anthropic") as "anthropic" | "openai" | "gemini",
+  modelBaseUrl: env("MODEL_BASE_URL") || (env("MODEL_PROVIDER") === "gemini" ? "https://generativelanguage.googleapis.com/v1beta" : "https://api.anthropic.com"),
   modelApiKey: env("MODEL_API_KEY"),
   modelName: env("MODEL_NAME", "claude-sonnet-5-5"),
   modelNameLarge: env("MODEL_NAME_LARGE") || env("MODEL_NAME", "claude-sonnet-5-5"),

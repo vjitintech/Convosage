@@ -61,7 +61,8 @@ bash tests/run-e2e.sh            # both suites; or: bash tests/run-e2e.sh tests/
 
 Run the capture test the way production is configured with Gemini (OpenAI-compatible endpoint), and with a rejected key:
 ```bash
-AI_MODE=openai bash tests/run-e2e.sh tests/e2e-capture.mjs
+AI_MODE=gemini bash tests/run-e2e.sh tests/e2e-capture.mjs   # native Gemini (AQ. keys)
+AI_MODE=openai bash tests/run-e2e.sh tests/e2e-capture.mjs   # OpenAI-compatible
 AI_MODE=openai KEY=bad-key EXPECT_BAD_KEY=1 bash tests/run-e2e.sh tests/e2e-capture.mjs
 ```
 In the app, **Settings → Check AI setup** tests the text model, screen reading and speech-to-text against your real keys.

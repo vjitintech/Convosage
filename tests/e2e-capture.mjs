@@ -69,7 +69,7 @@ const BAD = process.env.EXPECT_BAD_KEY === "1";
 if (BAD) {
   // AI key rejected (e.g. wrong Gemini key): transcript still works, and the panel says exactly what is wrong.
   await page.waitForSelector("text=Questions couldn't be generated", { timeout: 45000 });
-  await page.waitForSelector("text=rejected the API key"); log("bad AI key: panel explains the problem instead of 'Something went wrong'");
+  await page.waitForSelector("text=" + (process.env.EXPECT_ERR || "rejected the API key")); log("bad AI key: panel explains the problem instead of 'Something went wrong'");
   await shot(page, "b1-bad-key");
   await page.getByRole("button", { name: /Settings/ }).click(); await page.getByRole("button", { name: "Check AI setup" }).click();
   await page.waitForSelector("text=✗ Questions & answers"); await page.waitForSelector("text=✓ Speech-to-text");

@@ -39,13 +39,41 @@ async function postJSON(url: string, headers: Record<string, string>, body: unkn
 export function aiError(e: unknown, what = "AI"): HttpError {
   if (e instanceof HttpError) return e;
   const st = (e as { status?: number }).status || 0; const raw = String((e as Error)?.message || e).slice(0, 260);
-  if (st === 401 || st === 403 || /api key|API_KEY_INVALID|PERMISSION_DENIED|unauthori/i.test(raw))
-    return new HttpError(502, "ai_key_rejected", `The ${what} provider rejected the API key (${raw}). Check MODEL_API_KEY in Supabase secrets — for Gemini use a key from aistudio.google.com that starts with "AIza".`);
+  if (st === 401 || st === 403 || /api key|API_KEY_INVALID|PERMISSION_DENIED|unauthori|ACCESS_TOKEN_TYPE_UNSUPPORTED/i.test(raw)) {
+    const aqOnOpenAi = config.modelProvider === "openai" && config.modelApiKey.startsWith("AQ.");
+    return new HttpError(502, "ai_key_rejected", aqOnOpenAi
+      ? `Gemini rejected the key on its OpenAI-compatible address (${raw}). New AI Studio keys (AQ.…) only work with Gemini's native API: set MODEL_PROVIDER=gemini and remove MODEL_BASE_URL.`
+      : `The ${what} provider rejected the API key (${raw}). Check MODEL_API_KEY in Supabase secrets (copy the whole key from aistudio.google.com/apikey).`);
+  }
   if (st === 429 || /quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(raw))
     return new HttpError(429, "ai_rate_limited", `The ${what} provider's rate limit or free quota was reached (${raw}). It resumes automatically; for long meetings use a paid key or a lighter model.`);
   if (st === 404 || (st >= 400 && st < 500 && /not found|does not exist|unknown model|is not supported/i.test(raw)))
     return new HttpError(502, "ai_model_not_found", `The ${what} model name wasn't accepted (${raw}). Check MODEL_NAME / MODEL_NAME_LARGE / VISION_MODEL (e.g. gemini-2.5-flash).`);
   return new HttpError(502, "ai_failed", `The ${what} provider returned an error (${raw}). Check MODEL_BASE_URL / MODEL_NAME / MODEL_API_KEY.`);
+}
+
+// ---------------------------------------------------------------- Google Gemini (native generateContent API)
+// Used with MODEL_PROVIDER=gemini. Works with AI Studio's AQ.… keys (sent as x-goog-api-key).
+const geminiBase = () => config.modelBaseUrl.replace(/\/openai\/?$/, "").replace(/\/$/, "");
+// Gemini accepts an OpenAPI subset for function parameters: drop keys it rejects.
+function geminiSchema(x: unknown): unknown {
+  if (Array.isArray(x)) return x.map(geminiSchema);
+  if (!x || typeof x !== "object") return x;
+  const o: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(x as Record<string, unknown>)) {
+    if (["$schema", "additionalProperties", "$id", "$ref", "definitions", "$defs", "default", "examples", "const"].includes(k)) continue;
+    o[k] = geminiSchema(v);
+  }
+  return o;
+}
+async function geminiGenerate(model: string, body: Record<string, unknown>) {
+  return await withRetry(() => postJSON(`${geminiBase()}/models/${encodeURIComponent(model)}:generateContent`, { "x-goog-api-key": config.modelApiKey }, body));
+}
+type GPart = { text?: string; thought?: boolean; functionCall?: { name: string; args?: unknown }; inlineData?: { mimeType: string; data: string } };
+function geminiParts(r: Record<string, unknown>): GPart[] {
+  const c = (r.candidates as { content?: { parts?: GPart[] }; finishReason?: string }[] | undefined)?.[0];
+  if (!c) { const fb = (r.promptFeedback as { blockReason?: string } | undefined)?.blockReason; throw new HttpError(502, "ai_blocked", "Gemini returned no answer" + (fb ? ` (blocked: ${fb})` : "") + "."); }
+  return c.content?.parts || [];
 }
 
 export function parseJSONLoose<T = unknown>(t: string): T {
@@ -144,6 +172,27 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
           results.push({ type: "tool_result", tool_use_id: u.id, content: out.text, is_error: !out.ok });
         }
         messages.push({ role: "user", content: results });
+      }
+      throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
+    }
+    if (config.modelProvider === "gemini") {
+      const contents: Record<string, unknown>[] = [{ role: "user", parts: [{ text: opts.prompt }] }];
+      for (let step = 0; step < 5; step++) {
+        const body: Record<string, unknown> = { systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: { temperature: 0.2 } };
+        if (tools.length && calls < config.mcpMaxToolCalls) body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description.slice(0, 1000), parameters: geminiSchema(t.schema) })) }];
+        const r = await geminiGenerate(model, body);
+        const parts = geminiParts(r);
+        const fcs = parts.filter((p) => p.functionCall);
+        if (!fcs.length) { const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join(""); await audit({ purpose: opts.purpose, model, tools: used }); return { text, toolsUsed: used, model, provider: "gemini" }; }
+        contents.push({ role: "model", parts });
+        const responses = [];
+        for (const p of fcs) {
+          const t = byName[p.functionCall!.name]; let out = { ok: false, text: "Unknown tool" };
+          if (t && calls < config.mcpMaxToolCalls) { calls++; out = await callMcp(t, p.functionCall!.args || {}); used.push(`${t.server.name}/${t.remote}`); await sql()`select app.audit(${opts.workspaceId}, ${opts.actorId}, 'mcp_tool', ${t.server.name + "/" + t.remote}, 'mcp.tool_call', ${sql().json({ ok: out.ok })})`; }
+          else if (t) out = { ok: false, text: "Tool budget reached; answer with what you have." };
+          responses.push({ functionResponse: { name: p.functionCall!.name, response: { ok: out.ok, content: out.text } } });
+        }
+        contents.push({ role: "user", parts: responses });
       }
       throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
     }
@@ -264,7 +313,11 @@ export async function readFrame(jpeg: Uint8Array, workspaceId: string, actorId: 
   const ask = 'Extract the visible content of this shared-screen frame from a meeting. The screen may be in ANY language: write title and text in ENGLISH (translate if needed; keep code, names and numbers verbatim). Return ONLY JSON: {"type":"slide|table|diagram|code|screen","title":"slide title in English or empty","text":"all readable text in English; tables as Markdown; code verbatim; diagrams as a short description of boxes and arrows","language":"ISO code of the language shown on screen, e.g. en, hi, ja","confidence":0.0}. Ignore meeting-app chrome (toolbars, participant tiles, chat buttons). If nothing meaningful is visible, return type "screen" with empty text.';
   let out = "";
   try {
-  if (config.modelProvider === "anthropic") {
+  if (config.modelProvider === "gemini") {
+    const r = await geminiGenerate(config.visionModel, { systemInstruction: { parts: [{ text: SYSTEM }] }, generationConfig: { temperature: 0 },
+      contents: [{ role: "user", parts: [{ inlineData: { mimeType: "image/jpeg", data: b64 } }, { text: ask }] }] });
+    out = geminiParts(r).filter((p) => p.text && !p.thought).map((p) => p.text).join("");
+  } else if (config.modelProvider === "anthropic") {
     const r = await withRetry(() => postJSON(config.modelBaseUrl.replace(/\/$/, "") + "/v1/messages", { "x-api-key": config.modelApiKey, "anthropic-version": "2023-06-01" },
       { model: config.visionModel, max_tokens: 2000, system: SYSTEM, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } }, { type: "text", text: ask }] }] }));
     out = ((r.content || []) as { type: string; text?: string }[]).filter((c) => c.type === "text").map((c) => c.text).join("");
