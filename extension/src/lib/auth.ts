@@ -5,6 +5,17 @@ import { endpoints, getLocal, removeLocal, setLocal } from "./storage";
 export interface Session { access_token: string; refresh_token: string; expires_at: number; user: { id: string; phone?: string } }
 const KEY = "authSession";
 
+function explain(raw: string, step: "send" | "verify" | "other"): string {
+  const m = raw || "Request failed";
+  if (/rate limit|too many|security purposes/i.test(m)) return "Too many attempts. Please wait a minute and try again.";
+  if (/invalid api key|no api key|apikey/i.test(m)) return "Setup problem: the Supabase URL or publishable key in config.ts is wrong (" + m + ").";
+  if (/unsupported phone provider|phone.*(disabled|not enabled)|signups not allowed/i.test(m)) return "Setup problem: phone sign-in isn't enabled in Supabase (Authentication → Providers → Phone). (" + m + ")";
+  if (step === "send" && /sending|provider|twilio|sms/i.test(m)) return "Couldn't send the SMS: " + m + ". Check the Twilio Verify settings in Supabase.";
+  if (step === "send" && /phone/i.test(m)) return "That mobile number wasn't accepted: " + m;
+  if (step === "verify" && /invalid|expired/i.test(m)) return "That code is incorrect or has expired.";
+  return m;
+}
+
 async function gotrue(path: string, body: unknown, accessToken?: string) {
   const e = await endpoints();
   const res = await fetch(e.supabaseUrl + "/auth/v1" + path, {
@@ -14,8 +25,8 @@ async function gotrue(path: string, body: unknown, accessToken?: string) {
   });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = j.msg || j.error_description || j.message || "Request failed";
-    throw new Error(/rate limit|too many/i.test(msg) ? "Too many attempts. Please wait a minute and try again." : /invalid|expired/i.test(msg) ? "That code is incorrect or has expired." : msg);
+    const msg = String(j.msg || j.error_description || j.message || j.error || `HTTP ${res.status}`);
+    throw new Error(explain(msg, path.startsWith("/otp") ? "send" : path.startsWith("/verify") ? "verify" : "other"));
   }
   return j;
 }
