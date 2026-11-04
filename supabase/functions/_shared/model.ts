@@ -178,6 +178,8 @@ const HALLUCINATIONS = [
 const norm = (t: string) => t.toLowerCase().normalize("NFKC").replace(/[.,!?¡¿…"'“”‘’()\-–—:;]/g, " ").replace(/\s+/g, " ").trim();
 export function isLikelyHallucination(text: string): boolean {
   const n = norm(text); if (!n) return true;
+  if (n.replace(/\s/g, "").length <= 2) return true;                 // "ん", "I", "Oh"
+  if (["oh", "ah", "uh", "um", "hmm", "mm", "liz", "hello", "all right", "alright", "yeah", "yes", "no", "que", "qué"].includes(n)) return true; // lone fillers
   if (HALLUCINATIONS.some((h) => n === h || n.startsWith("subtitles") || n.includes("amara.org"))) return true;
   const w = n.split(" "); if (w.length >= 6 && new Set(w).size / w.length < 0.3) return true; // looping repetition
   return false;

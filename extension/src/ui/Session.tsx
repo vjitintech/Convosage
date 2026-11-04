@@ -71,7 +71,7 @@ export function SessionView({ me, ws, initial, programme, onBack, onEntitlementC
         {s.status === "active" && <button className="btn" onClick={() => setConfirm("disable")}>Disable session</button>}
         {s.status === "disabled" && <button className="btn pri" onClick={() => setConfirm("enable")}>Enable session</button>}
         {(s.status === "active" || s.status === "disabled") && <button className="btn" onClick={() => setConfirm("archive")}>Archive</button>}
-        {s.status === "deletion_pending" ? <button className="btn" onClick={async () => { await api(`/v1/sessions/${s.id}/restore`, { method: "POST" }); reloadSession(); }}>Cancel deletion</button>
+        {s.status === "deletion_pending" ? <><button className="btn danger" onClick={async () => { try { await api(`/v1/sessions/${s.id}?mode=now`, { method: "DELETE" }); toast("Session deleted"); onBack(); } catch (e) { setError((e as Error).message); } }}>Delete now</button><button className="btn" onClick={async () => { await api(`/v1/sessions/${s.id}/restore`, { method: "POST" }); reloadSession(); }}>Cancel deletion</button></>
           : <button className="btn danger" onClick={() => setConfirm("delete")}>Delete…</button>}
       </div>}
       {s.status === "disabled" && <div className="notice warn">Disabled: new capture and processing are blocked. Existing content is kept. Enabling won't restart capture — you'll start a new capture yourself.</div>}
@@ -146,6 +146,12 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
         <button className="btn danger" onClick={() => { chrome.runtime.sendMessage({ type: "CAPTURE_STOP", reason: "user_stopped" }); toast("Capture stopped — reviewing the whole meeting for wrap-up questions…"); }}>■ Stop capture</button>
         <span className="small">{cap.queued ? `${cap.queued} waiting to upload` : "Up to date"}</span>
       </div>}
+      {capturingThis && <div className="row small" aria-live="polite">
+        {cap.sources.includes("tab_audio") && <span>{cap.levels?.tab_audio == null ? "🎧 Listening…" : cap.levels.tab_audio > 0.04 ? "🎧 Hearing the meeting" : "🔇 No sound from the meeting — is it playing and unmuted?"}</span>}
+        {cap.sources.includes("display") && <span>🖥 Reading the screen{cap.frames ? " ✓" : "…"}</span>}
+        {cap.sources.includes("microphone") && <span>🎙 Mic{cap.levels?.microphone ? " ✓" : ""}</span>}
+      </div>}
+      {capturingThis && cap.host === "panel" && <div className="notice">Keep this side panel open while capturing — closing it stops the capture.</div>}
       {capturingThis && cap.degraded.map((d) => <div key={d} className="notice warn">⚠ {d}</div>)}
       {capturingThis && cap.lastError && <div className="notice warn">{cap.lastError}</div>}
       {active && <form className="row" style={{ flexWrap: "nowrap" }} onSubmit={async (e) => { e.preventDefault(); if (!note.trim()) return; try { await api(`/v1/sessions/${s.id}/segments`, { body: { segments: [{ start_ms: capturingThis && cap.startedAt ? Date.now() - cap.startedAt : 0, text: note.trim(), speaker_label: "Note" }] } }); setNote(""); loadSegs(); } catch (er) { setError((er as Error).message); } }}>
@@ -194,49 +200,87 @@ function QuestionCard({ q, patch }: { q: Question; patch: (b: Record<string, unk
   </article>;
 }
 
+// Chrome's share window must be opened from a visible extension page (the side panel). Called from the
+// background service worker it has no window to attach to and returns "cancelled" immediately.
+function chooseShare(prefer: "tab" | "screen", audio: boolean): Promise<{ streamId: string | null; canAudio: boolean }> {
+  const base = prefer === "screen" ? ["screen", "window", "tab"] : ["tab", "screen", "window"];
+  return new Promise((res) => chrome.desktopCapture.chooseDesktopMedia((audio ? [...base, "audio"] : base) as any,
+    (streamId, options) => res({ streamId: streamId || null, canAudio: !!options?.canRequestAudioTrack })));
+}
+
 function StartCapture({ s, onClose, onError }: { s: SessionRow; onClose: () => void; onError: (e: string | null) => void }) {
-  const [tabAudio, setTabAudio] = useState(true); const [mic, setMic] = useState(false); const [screen, setScreen] = useState(false); const [agree, setAgree] = useState(false);
+  const [tabs, setTabs] = useState<chrome.tabs.Tab[]>([]); const [tabId, setTabId] = useState<number | null>(null);
+  const [mode, setMode] = useState<"tab" | "screen">("tab");
+  const [hear, setHear] = useState(true); const [see, setSee] = useState(true); const [mic, setMic] = useState(false); const [agree, setAgree] = useState(false);
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => { (async () => {
+    const all = (await chrome.tabs.query({})).filter((t) => t.id && /^https?:/.test(t.url || ""));
+    const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const pick = all.find((t) => t.id === act?.id && /^https?:/.test(act?.url || "")) || all.find((t) => t.audible) || all[0];
+    setTabs(all); setTabId(pick?.id ?? null);
+  })().catch(() => {}); }, []);
+  const tab = tabs.find((t) => t.id === tabId);
   const start = async () => {
     setBusy(true); setMsg(null); onError(null);
     try {
-      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      let tabStreamId: string | null = null, desktopStreamId: string | null = null, desktopAudio = false;
-      let needPickerAudio = false;
-      if (tabAudio) {
-        const capturable = tab?.id && !/^(chrome|edge|about|chrome-extension|devtools):/.test(tab.url || "");
-        if (capturable) {
-          try { tabStreamId = await new Promise<string>((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: tab!.id! }, (id) => (chrome.runtime.lastError || !id ? rej(chrome.runtime.lastError) : res(id)))); }
-          catch { needPickerAudio = true; } // Chrome only allows direct tab capture right after the icon was clicked on that tab
-        } else needPickerAudio = true;
-      }
+      if (mode === "tab" && !tab) throw new Error("Open the meeting or video in a browser tab first, then choose it here.");
       if (mic) {
         const p = await navigator.permissions.query({ name: "microphone" as PermissionName }).catch(() => null);
         if (!p || p.state !== "granted") { await chrome.tabs.create({ url: chrome.runtime.getURL("permission.html") }); setMsg("Allow the microphone in the tab that just opened, then press Start again."); setBusy(false); return; }
       }
-      if (screen || needPickerAudio) {
-        if (needPickerAudio) setMsg("Chrome's share window is open: pick the meeting TAB (or Entire screen on Windows) and tick “Share tab audio” / “Share system audio”.");
-        const r = await chrome.runtime.sendMessage({ type: "CHOOSE_DESKTOP", audio: needPickerAudio });
-        desktopStreamId = r?.streamId || null; desktopAudio = needPickerAudio && !!r?.canAudio;
-        if (needPickerAudio && desktopStreamId && !desktopAudio) throw new Error("No audio was shared. Start again, choose the meeting tab (or Entire screen on Windows) and tick “Share tab audio” / “Share system audio”.");
-        if (!desktopStreamId && !mic) throw new Error("Sharing was cancelled.");
+      let tabStreamId: string | null = null, desktopStreamId: string | null = null, desktopAudio = false, desktopVideo = false;
+      if (mode === "tab" && (hear || see)) {
+        // Direct tab capture works without any prompt when Chrome allows it; otherwise Chrome's share window is used.
+        try { tabStreamId = await new Promise<string>((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: tab!.id! }, (id) => (chrome.runtime.lastError || !id ? rej(chrome.runtime.lastError) : res(id)))); } catch { tabStreamId = null; }
+        if (!tabStreamId) {
+          setMsg(`In Chrome's share window choose the tab “${(tab!.title || "meeting").slice(0, 60)}”${hear ? " and keep “Share tab audio” ON" : ""}, then press Share.`);
+          await chrome.tabs.update(tab!.id!, { active: true }).catch(() => {});
+          const r = await chooseShare("tab", hear);
+          if (!r?.streamId) throw new Error("Sharing was cancelled — nothing is being captured.");
+          if (hear && !r.canAudio) throw new Error("“Share tab audio” was off, so the meeting can't be heard. Start again and keep it ON.");
+          desktopStreamId = r.streamId; desktopAudio = hear; desktopVideo = see;
+        }
       }
-      const sources = [(tabStreamId || desktopAudio) && "tab_audio", mic && "microphone", desktopStreamId && screen && "display"].filter(Boolean) as string[];
-      const cap = await api(`/v1/sessions/${s.id}/capture/start`, { body: { source_types: sources, consent: { accepted: true, statement: CONSENT }, browser_info: { ua: navigator.userAgent, platform: (navigator as any).userAgentData?.platform || navigator.platform }, permission_state: { tab_audio: !!tabStreamId, microphone: mic, display: !!desktopStreamId } } });
+      if (mode === "screen") {
+        setMsg("In Chrome's share window choose Entire screen (or the app window) and turn ON “Share system audio”.");
+        const r = await chooseShare("screen", hear);
+        if (!r?.streamId) throw new Error("Sharing was cancelled — nothing is being captured.");
+        if (hear && !r.canAudio) throw new Error("“Share system audio” was off, so the meeting can't be heard. Start again and turn it ON (Windows/ChromeOS).");
+        desktopStreamId = r.streamId; desktopAudio = hear; desktopVideo = see;
+      }
+      const sources = [hear && "tab_audio", mic && "microphone", see && "display"].filter(Boolean) as string[];
+      if (!sources.length) throw new Error("Choose at least one thing to capture.");
+      const cap = await api(`/v1/sessions/${s.id}/capture/start`, { body: { source_types: sources, consent: { accepted: true, statement: CONSENT }, browser_info: { ua: navigator.userAgent, platform: (navigator as any).userAgentData?.platform || navigator.platform }, permission_state: { tab_audio: hear, microphone: mic, display: see } } });
       const baseMs = s.started_at ? Math.max(0, Date.now() - new Date(s.started_at).getTime()) : 0;
-      const r = await chrome.runtime.sendMessage({ type: "CAPTURE_START", params: { sessionId: s.id, captureId: cap.capture_id, captureToken: cap.capture_token, expiresAt: cap.expires_at, baseMs, tabStreamId, desktopStreamId, desktopAudio, desktopVideo: screen, mic } });
+      const params = { sessionId: s.id, captureId: cap.capture_id, captureToken: cap.capture_token, expiresAt: cap.expires_at, baseMs, tabStreamId, tabAudio: hear, tabVideo: see, desktopStreamId, desktopAudio, desktopVideo, mic };
+      let r: { ok?: boolean; degraded?: string[] } | undefined;
+      if (desktopStreamId) {
+        // A share-window stream can only be opened by this page, so the capture runs here in the side panel.
+        const { installEngine, engine } = await import("../capture-engine"); installEngine("panel");
+        r = await engine.start(params);
+      } else r = await chrome.runtime.sendMessage({ type: "CAPTURE_START", params });
       if (!r?.ok) { await api(`/v1/sessions/${s.id}/capture/stop`, { body: { capture_id: cap.capture_id, reason: "start_failed" } }).catch(() => {}); throw new Error((r?.degraded || []).join(" ") || "Capture couldn't start."); }
       onClose();
     } catch (e) { setMsg((e as Error).message); } finally { setBusy(false); }
   };
   return <Modal title="Start capture" onClose={onClose}>
-    <div className="small">Choose exactly what CONVOSAGE may capture. You can pause or stop at any time; the toolbar icon shows REC while capturing.</div>
-    <label className="chk"><input type="checkbox" checked={tabAudio} onChange={(e) => setTabAudio(e.target.checked)} /><span><b>Meeting tab audio</b><br /><span className="small">Zoom / Meet / Teams in the browser. If Chrome asks, pick the meeting tab and tick “Share tab audio”. On Windows you can pick Entire screen + “Share system audio” to include the Zoom/Teams desktop apps.</span></span></label>
-    <label className="chk"><input type="checkbox" checked={mic} onChange={(e) => setMic(e.target.checked)} /><span><b>My microphone</b><br /><span className="small">Your own voice, for in-person or hybrid sessions.</span></span></label>
-    <label className="chk"><input type="checkbox" checked={screen} onChange={(e) => setScreen(e.target.checked)} /><span><b>Shared screen / slides</b><br /><span className="small">You'll pick one screen, window or tab. Frames are sampled when the view changes and read for slide text.</span></span></label>
+    <div className="small">CONVOSAGE listens to the meeting and reads what is shown, then suggests questions live. Nothing is recorded or stored as audio/video.</div>
+    <div className="row" role="radiogroup" aria-label="What to capture from">
+      <button role="radio" aria-checked={mode === "tab"} className={"btn sm " + (mode === "tab" ? "dark" : "")} onClick={() => setMode("tab")}>A browser tab</button>
+      <button role="radio" aria-checked={mode === "screen"} className={"btn sm " + (mode === "screen" ? "dark" : "")} onClick={() => setMode("screen")}>Entire screen / app</button>
+    </div>
+    {mode === "tab" ? <label>Meeting or video tab
+      <select aria-label="Meeting tab" value={tabId ?? ""} onChange={(e) => setTabId(Number(e.target.value))}>
+        {!tabs.length && <option value="">No web tabs open</option>}
+        {tabs.map((t) => <option key={t.id} value={t.id}>{t.audible ? "🔊 " : ""}{(t.title || t.url || "").slice(0, 70)}</option>)}
+      </select></label>
+      : <div className="small">For the Zoom / Teams desktop apps. Windows & ChromeOS can share system audio; on macOS use the browser version of the meeting instead.</div>}
+    <label className="chk"><input type="checkbox" checked={hear} onChange={(e) => setHear(e.target.checked)} /><span><b>What is said</b> — the {mode === "tab" ? "tab's" : "computer's"} audio, transcribed to English</span></label>
+    <label className="chk"><input type="checkbox" checked={see} onChange={(e) => setSee(e.target.checked)} /><span><b>What is shown</b> — slides, documents and screen shares, read when the view changes</span></label>
+    <label className="chk"><input type="checkbox" checked={mic} onChange={(e) => setMic(e.target.checked)} /><span><b>My microphone</b> — only for in-person rooms. Not needed for online meetings or videos.</span></label>
     <label className="chk"><input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} /><span>{CONSENT}</span></label>
     {msg && <div className="notice warn" role="alert">{msg}</div>}
-    <div className="row"><button className="btn pri" disabled={busy || !agree || (!tabAudio && !mic && !screen)} onClick={start}>{busy ? "Starting…" : "Start capture"}</button><button className="btn" onClick={onClose}>Cancel</button></div>
+    <div className="row"><button className="btn pri" disabled={busy || !agree || (!hear && !mic && !see)} onClick={start}>{busy ? "Starting…" : "Start capture"}</button><button className="btn" onClick={onClose}>Cancel</button></div>
   </Modal>;
 }
 

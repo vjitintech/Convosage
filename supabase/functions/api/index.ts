@@ -234,7 +234,8 @@ async function purgeSession(sessionId: string, actor: string | null, reason: str
 }
 r.add("DELETE", "/v1/sessions/:id", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
-  const mode = url.searchParams.get("mode") || (config.deletionGraceDays === 0 ? "now" : "scheduled");
+  // Delete means delete: erase now. A grace period is only used when explicitly asked for (?mode=scheduled).
+  const mode = url.searchParams.get("mode") === "scheduled" ? "scheduled" : "now";
   if (mode === "now") { await purgeSession(s.id, u.id, "user_requested"); return json(req, { session_id: s.id, status: "deleted", purged: true }); }
   const [row] = await db()`select app.transition_session(${s.id}, ${u.id}, 'deletion_pending', 'user_requested') as s`;
   return json(req, { session_id: s.id, status: (row.s as Record<string, unknown>).status, purge_after_days: config.deletionGraceDays || 7 });
