@@ -62,3 +62,11 @@ For customers, install from the Chrome Web Store or Edge Add-ons, or via your or
 - Screen capture uses bandwidth, battery and CPU.
 - Speakers are labelled "Unknown speaker" unless known; voice-based identification isn't attempted.
 - AI output can be wrong. Evidence and human review remain necessary.
+
+## Questions during and after the meeting
+- Questions appear **live** while capture runs. Filter with **To ask / Wrap-up / Answered / Dismissed / All**.
+- Audio (tab or system audio, plus optional mic), uploaded transcripts and on-screen content all feed the same session. This works the same for a live meeting and for a recording played in the browser.
+- When you press **Stop capture**, Convosage reviews the **whole meeting** and adds up to 6 **wrap-up** questions (tagged "wrap-up"). You can also press **Wrap-up questions** at any time.
+
+## Deleting a session
+**Delete permanently** erases the transcript, questions, knowledge and documents immediately. An audit record is kept. Sessions under legal hold can't be deleted. To keep an undo window instead, set `DELETION_GRACE_DAYS` (for example 7) in the server secrets.

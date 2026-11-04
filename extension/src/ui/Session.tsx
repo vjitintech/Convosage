@@ -93,9 +93,10 @@ export function SessionView({ me, ws, initial, programme, onBack, onEntitlementC
       body={<>{capturingThis ? <p><b>Capture is running.</b> It will stop now and the stream will close.</p> : null}<p>New capture and new processing will be blocked on the server. Existing transcript, questions and knowledge are kept.</p></>} />}
     {confirm === "enable" && <Confirm title="Enable this session?" confirmLabel="Enable session" onClose={() => setConfirm(null)} onConfirm={() => setStatus("active")} body={<p>The session becomes Active. Capture does <b>not</b> restart automatically — press Start capture when you're ready.</p>} />}
     {confirm === "archive" && <Confirm title="Archive this session?" confirmLabel="Archive" onClose={() => setConfirm(null)} onConfirm={() => setStatus("archived")} body={<p>Archived sessions are read-only history and cannot capture again.</p>} />}
-    {confirm === "delete" && <Confirm danger title="Delete this session?" confirmLabel="Schedule deletion" onClose={() => setConfirm(null)}
-      onConfirm={async () => { if (capturingThis) await chrome.runtime.sendMessage({ type: "CAPTURE_STOP", reason: "session_deleted" }); const r = await api(`/v1/sessions/${s.id}`, { method: "DELETE" }); toast(`Deletion scheduled (purged after ${r.purge_after_days} days)`); reloadSession(); }}
-      body={<p>The session and everything derived from it will be permanently deleted after the grace period, subject to your workspace's retention and legal-hold policy. You can cancel until then.</p>} />}
+    {confirm === "delete" && <Confirm danger title="Delete this session permanently?" confirmLabel="Delete permanently" onClose={() => setConfirm(null)}
+      onConfirm={async () => { try { if (capturingThis) await chrome.runtime.sendMessage({ type: "CAPTURE_STOP", reason: "session_deleted" }); const r = await api(`/v1/sessions/${s.id}`, { method: "DELETE" });
+        if (r.status === "deleted") { toast("Session deleted"); onBack(); } else { toast(`Deletion scheduled (erased after ${r.purge_after_days} days)`); reloadSession(); } } catch (e) { setError((e as Error).message); } }}
+      body={<p>The transcript, questions, answers, knowledge and documents of this session are erased <b>now</b>. This can't be undone. (Sessions under legal hold can't be deleted.)</p>} />}
     {rename && <RenameModal s={s} onClose={() => setRename(false)} onDone={(t) => { setS({ ...s, title: t }); setRename(false); }} />}
   </>;
 }
@@ -111,7 +112,7 @@ const CONSENT = "I have permission to capture this meeting under the organiser's
 
 function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }: { me: Me; s: SessionRow; tick: number; cap: CaptureStatus; capturingThis: boolean; onEntitlementChange: () => void; setError: (e: string | null) => void }) {
   const [segs, setSegs] = useState<Segment[]>([]); const [qs, setQs] = useState<Question[]>([]);
-  const [filter, setFilter] = useState<"open" | "answered" | "dismissed" | "all">("open");
+  const [filter, setFilter] = useState<"open" | "wrapup" | "answered" | "dismissed" | "all">("open");
   const [startOpen, setStartOpen] = useState(false); const [note, setNote] = useState(""); const [genBusy, setGenBusy] = useState(false);
   const lastId = useRef(0); const toast = useToast(); const boxRef = useRef<HTMLDivElement>(null);
   const loadSegs = async (reset = false) => { if (reset) lastId.current = 0; const r = await api(`/v1/sessions/${s.id}/transcript?after_id=${lastId.current}`); if (r.segments.length) { lastId.current = r.segments[r.segments.length - 1].id; setSegs((old) => { const base = reset ? [] : old; const seen = new Set(base.map((x) => x.id)); return [...base, ...r.segments.filter((x: Segment) => !seen.has(x.id))].sort((a, b) => a.start_ms - b.start_ms || a.id - b.id); }); } else if (reset) setSegs([]); };
@@ -121,7 +122,7 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
   useEffect(() => { const b = boxRef.current; if (b && b.scrollHeight - b.scrollTop - b.clientHeight < 80) b.scrollTop = b.scrollHeight; }, [segs.length]);
 
   const patchQ = async (q: Question, body: Record<string, unknown>) => { try { const r = await api<Question>(`/v1/questions/${q.id}`, { method: "PATCH", body }); setQs((a) => a.map((x) => (x.id === q.id ? { ...x, ...r } : x))); } catch (e) { setError((e as Error).message); } };
-  const shown = qs.filter((q) => filter === "all" || (filter === "open" ? ["suggested", "saved"].includes(q.state) : q.state === filter))
+  const shown = qs.filter((q) => filter === "all" || (filter === "open" ? ["suggested", "saved"].includes(q.state) : filter === "wrapup" ? q.phase === "final" && q.state !== "dismissed" : q.state === filter))
     .sort((a, b) => (b.state === "saved" ? 1 : 0) - (a.state === "saved" ? 1 : 0) || ({ critical: 4, high: 3, medium: 2, low: 1 }[b.priority] - { critical: 4, high: 3, medium: 2, low: 1 }[a.priority]) || +new Date(b.created_at) - +new Date(a.created_at));
   const active = s.status === "active";
   const otherCapture = cap.state !== "idle" && !capturingThis;
@@ -138,7 +139,7 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
       </div>}
       {capturingThis && <div className="row">
         {cap.state === "paused" ? <button className="btn pri" onClick={() => chrome.runtime.sendMessage({ type: "CAPTURE_RESUME" })}>▶ Resume</button> : <button className="btn" onClick={() => chrome.runtime.sendMessage({ type: "CAPTURE_PAUSE" })}>⏸ Pause</button>}
-        <button className="btn danger" onClick={() => chrome.runtime.sendMessage({ type: "CAPTURE_STOP", reason: "user_stopped" })}>■ Stop capture</button>
+        <button className="btn danger" onClick={() => { chrome.runtime.sendMessage({ type: "CAPTURE_STOP", reason: "user_stopped" }); toast("Capture stopped — reviewing the whole meeting for wrap-up questions…"); }}>■ Stop capture</button>
         <span className="small">{cap.queued ? `${cap.queued} waiting to upload` : "Up to date"}</span>
       </div>}
       {capturingThis && cap.degraded.map((d) => <div key={d} className="notice warn">⚠ {d}</div>)}
@@ -150,9 +151,10 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
     <div className="card stack" aria-live="polite">
       <div className="row"><h3 className="sp">Questions</h3>
         {active && me.entitlement.active && <button className="btn sm" disabled={genBusy} onClick={async () => { setGenBusy(true); try { const r = await api(`/v1/sessions/${s.id}/questions/generate`, { method: "POST" }); toast(r.added ? "New questions added" : "Nothing new to ask right now"); loadQs(); } catch (e) { setError((e as Error).message); } finally { setGenBusy(false); } }}>{genBusy ? "Thinking…" : "Suggest now"}</button>}
+        {active && me.entitlement.active && segs.length > 0 && <button className="btn sm" disabled={genBusy} onClick={async () => { setGenBusy(true); try { const r = await api(`/v1/sessions/${s.id}/questions/generate?final=1`, { method: "POST" }); toast(r.added ? "Wrap-up questions added" : "No further questions for the whole meeting"); setFilter("wrapup"); loadQs(); } catch (e) { setError((e as Error).message); } finally { setGenBusy(false); } }}>Wrap-up questions</button>}
         <button className="btn sm" onClick={() => copy(shown.map((q, i) => `${i + 1}. ${q.text}`).join("\n"), toast)} disabled={!shown.length}>Copy all</button></div>
-      <div className="row" role="radiogroup" aria-label="Filter questions">{(["open", "answered", "dismissed", "all"] as const).map((f) => <button key={f} role="radio" aria-checked={filter === f} className={"btn sm " + (filter === f ? "dark" : "")} onClick={() => setFilter(f)}>{{ open: "To ask", answered: "Answered", dismissed: "Dismissed", all: "All" }[f]}</button>)}</div>
-      {!shown.length && <div className="empty">{filter === "open" ? (active ? "Questions appear here as the meeting is understood." : "No open questions.") : "None."}</div>}
+      <div className="row" role="radiogroup" aria-label="Filter questions">{(["open", "wrapup", "answered", "dismissed", "all"] as const).map((f) => <button key={f} role="radio" aria-checked={filter === f} className={"btn sm " + (filter === f ? "dark" : "")} onClick={() => setFilter(f)}>{{ open: "To ask", wrapup: "Wrap-up", answered: "Answered", dismissed: "Dismissed", all: "All" }[f]}</button>)}</div>
+      {!shown.length && <div className="empty">{filter === "open" ? (active ? "Questions appear here as the meeting is understood." : "No open questions.") : filter === "wrapup" ? "Wrap-up questions appear when you stop capture (or press “Wrap-up questions”). They review the whole meeting." : "None."}</div>}
       {shown.map((q) => <QuestionCard key={q.id} q={q} patch={(b) => patchQ(q, b)} />)}
     </div>
 
@@ -168,7 +170,7 @@ function QuestionCard({ q, patch }: { q: Question; patch: (b: Record<string, unk
   const [ans, setAns] = useState(false); const [answer, setAnswer] = useState(q.answer_text || ""); const toast = useToast();
   return <article className={"q " + q.priority} aria-label={`${q.priority} priority question`}>
     <div className="row" style={{ gap: 5, marginBottom: 4 }}><span className={"tag " + q.priority}>{q.priority}</span><span className="tag">{q.category.replace("_", " ")}</span>
-      {q.state !== "suggested" && <span className="tag">{q.state}</span>}<span className="sp" /><span className="small" title="Model confidence">confidence {Math.round(q.confidence * 100)}%</span></div>
+      {q.phase === "final" && <span className="tag" style={{ background: "#e2ebf4", color: "#2a557f" }}>wrap-up</span>}{q.state !== "suggested" && <span className="tag">{q.state}</span>}<span className="sp" /><span className="small" title="Model confidence">confidence {Math.round(q.confidence * 100)}%</span></div>
     <div className="qt">{q.text}</div>
     {q.rationale && <div className="small" style={{ marginTop: 4 }}><b>Why it matters:</b> {q.rationale}</div>}
     {q.evidence_refs.length ? <div className="ev">{q.evidence_refs.map((e) => <div key={e.ref}><span className="mono">{e.ref} · {fmtTime(e.start_ms ?? e.timestamp_ms ?? 0)}</span> “{e.snippet}”</div>)}</div> : <div className="ev small">General check — not tied to a specific moment (lower confidence).</div>}

@@ -15,6 +15,9 @@ http.createServer((req, res) => {
     const hasToolResult = Array.isArray(last?.content) && last.content.some((c) => c.type === "tool_result");
     const reply = (t) => send({ content: [{ type: "text", text: typeof t === "string" ? t : JSON.stringify(t) }], stop_reason: "end_turn" });
     if (hasImage) return reply({ type: "slide", title: "Claims batch recovery", text: "CLMV0200 restart: checkpoint STEP020\nRTO 2h", confidence: 0.9 });
+    if (firstText.includes("WRAP-UP")) { const t = firstRef(firstText, "T"); return reply({ questions: [
+        { text: "Who signs off the change to checkpoint restart, and by when will the runbook be updated?", rationale: "Decision and owner were not confirmed before the meeting ended.", category: "follow_up", priority: "high", confidence: 0.8, evidence: [t].filter(Boolean) },
+        { text: "Which downstream reports are affected if the warehouse extract moves after the payment run?", rationale: "Dependency raised but not resolved.", category: "risk", priority: "medium", confidence: 0.6, evidence: [] } ], answered: [] }); }
     if (firstText.includes("TASK: Suggest questions")) {
       const kb = (body.tools || []).find((t) => t.name.includes("search_kb"));
       if (kb && !hasToolResult) return send({ content: [{ type: "tool_use", id: "tu1", name: kb.name, input: { query: "CLMV0200" } }], stop_reason: "tool_use" });

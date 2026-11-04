@@ -46,7 +46,8 @@ export const config = {
   maxFrameBytes: num("MAX_FRAME_BYTES", 2_500_000),
   maxUploadTextChars: num("MAX_UPLOAD_TEXT_CHARS", 2_000_000),
   rateLimitPerMinute: num("RATE_LIMIT_PER_MINUTE", 240),
-  deletionGraceDays: num("DELETION_GRACE_DAYS", 7),
+  // 0 = deleting a session erases it immediately; >0 = keep it "Deletion pending" (restorable) for N days
+  deletionGraceDays: (() => { const g = Number(env("DELETION_GRACE_DAYS", "0")); return Number.isFinite(g) && g >= 0 ? Math.floor(g) : 0; })(),
   cronSecret: env("CRON_SECRET"),
   mcpSecretKey: env("MCP_SECRET_KEY"), // 32+ chars; encrypts MCP auth tokens at rest
 };

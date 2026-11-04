@@ -27,21 +27,25 @@ async function emit(sessionId: string, workspaceId: string, type: string, payloa
 const CATS = ["strategic", "technical", "clarification", "risk", "decision", "follow_up"] as const;
 const PRIS = ["critical", "high", "medium", "low"] as const;
 
-export async function generateQuestions(sessionId: string, actorId: string | null) {
+export async function generateQuestions(sessionId: string, actorId: string | null, opts: { final?: boolean } = {}) {
+  const final = !!opts.final;
   const db = sql();
   const [s] = await db`select s.*, p.title as programme_title from app.sessions s join app.programmes p on p.id = s.programme_id where s.id = ${sessionId}`;
   if (!s || s.status !== "active") return { added: 0, skipped: "session_not_active" };
   const ctx = await latestContext(s.programme_id);
-  const segs = await db`select id, start_ms, end_ms, speaker_label, text from app.transcript_segments where session_id = ${sessionId} order by start_ms desc, id desc limit 70`;
-  const vis = await db`select id, timestamp_ms, type, title, extracted_text from app.visual_evidence where session_id = ${sessionId} and coalesce(extracted_text,'') <> '' order by timestamp_ms desc limit 8`;
+  const segs = final
+    ? (await db`select id, start_ms, end_ms, speaker_label, text from app.transcript_segments where session_id = ${sessionId} order by start_ms, id limit 3000`).reverse()
+    : await db`select id, start_ms, end_ms, speaker_label, text from app.transcript_segments where session_id = ${sessionId} order by start_ms desc, id desc limit 70`;
+  const vis = await db`select id, timestamp_ms, type, title, extracted_text from app.visual_evidence where session_id = ${sessionId} and coalesce(extracted_text,'') <> '' order by timestamp_ms desc limit ${final ? 60 : 8}`;
   if (!segs.length && !vis.length) return { added: 0, skipped: "no_evidence" };
   const existing = await db`select id, text, state from app.question_suggestions where session_id = ${sessionId} order by created_at`;
   const prior = await db`select artifact_type, content from app.knowledge_artifacts where programme_id = ${s.programme_id} and status = 'current'
                          and artifact_type in ('open_question','gap','contradiction') and (session_id is null or session_id <> ${sessionId}) order by created_at desc limit 15`;
-  const transcript = segs.slice().reverse().map((g) => `T${g.id} [${fmt(g.start_ms)}] ${g.speaker_label}: ${redact(g.text)}`).join("\n");
+  let transcript = segs.slice().reverse().map((g) => `T${g.id} [${fmt(g.start_ms)}] ${g.speaker_label}: ${redact(g.text)}`).join("\n");
+  if (final && transcript.length > 70000) transcript = segs.slice().reverse().map((g) => `T${g.id} [${fmt(g.start_ms)}] ${g.speaker_label}: ${redact(g.text).slice(0, 140)}`).join("\n").slice(-90000);
   const visual = vis.slice().reverse().map((v) => `V${v.id} [${fmt(v.timestamp_ms)}] ${v.type}${v.title ? ` "${redact(v.title)}"` : ""}: ${redact(String(v.extracted_text)).slice(0, 700)}`).join("\n");
 
-  const prompt = `TASK: Suggest questions the attendee could ask NOW in this live meeting.
+  const prompt = `TASK: ${final ? "Suggest questions for the end of the meeting (WRAP-UP). The attendee has the WHOLE meeting below. Propose follow-up questions about unresolved gaps, decisions to confirm, risks, dependencies and items answered only partially — the things worth asking before everyone leaves or in a follow-up email." : "Suggest questions the attendee could ask NOW in this live meeting."}
 
 CONTEXT PROFILE (programme "${s.programme_title}", session "${redact(s.title)}"):
 ${contextForPrompt(ctx.content)}
@@ -59,7 +63,7 @@ ${visual || "(none)"}
 EXISTING QUESTIONS (never repeat or rephrase): ${JSON.stringify(existing.map((q) => ({ id: q.id, text: q.text, state: q.state })))}
 
 RULES
-- Up to 3 new questions. Each must add value, fit the context profile, not be answered already in the evidence, be concise enough to ask aloud (<= 30 words).
+- Up to ${final ? 6 : 3} new questions. Each must add value, fit the context profile, not be answered already in the evidence, be concise enough to ask aloud (<= 30 words).
 - Ground each question in evidence ids (T…/V…). If it is a general check with no direct evidence, use evidence [] and confidence <= 0.5.
 - If tools are available, you may look up approved reference material for a sharper question; list the tool in tool_refs. Never present tool content as something said in the meeting.
 - Also report existing suggested/saved questions that the evidence has now answered, with a short grounded answer and evidence ids.
@@ -67,11 +71,11 @@ Return ONLY JSON:
 {"questions":[{"text":"","rationale":"why it matters","category":"strategic|technical|clarification|risk|decision|follow_up","priority":"critical|high|medium|low","confidence":0.0,"evidence":["T1"],"evidence_quote":"short quote","tool_refs":[]}],
  "answered":[{"question_id":"","answer":"","evidence":["T9"]}]}`;
 
-  const { data, meta } = await chatJSON<{ questions?: Record<string, unknown>[]; answered?: Record<string, unknown>[] }>({ workspaceId: s.workspace_id, actorId, prompt, useTools: true, purpose: "questions" });
+  const { data, meta } = await chatJSON<{ questions?: Record<string, unknown>[]; answered?: Record<string, unknown>[] }>({ workspaceId: s.workspace_id, actorId, prompt, useTools: true, purpose: final ? "questions_final" : "questions", large: final, maxTokens: final ? 4000 : 3000 });
   const segIds = new Set(segs.map((g) => "T" + g.id)); const visIds = new Set(vis.map((v) => "V" + v.id));
   const validRefs = (refs: unknown) => (Array.isArray(refs) ? refs : []).map(String).filter((r) => segIds.has(r) || visIds.has(r)).slice(0, 6);
   let added = 0;
-  for (const q of (data.questions || []).slice(0, 3)) {
+  for (const q of (data.questions || []).slice(0, final ? 6 : 3)) {
     const text = String(q.text || "").trim().slice(0, 400);
     if (text.length < 8) continue;
     if (existing.some((e) => jaccard(e.text, text) >= 0.55)) continue;
@@ -89,7 +93,7 @@ Return ONLY JSON:
     try {
       const [row] = await db`insert into app.question_suggestions (session_id, workspace_id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, dedupe_key, model_meta)
         values (${sessionId}, ${s.workspace_id}, ${text}, ${String(q.rationale || "").slice(0, 600)}, ${cat as string}, ${pri as string}, ${conf}, ${db.json(evidenceRefs)}, ${db.json(toolRefs)}, ${dedupeKey(text)},
-                ${db.json({ model: meta.model, provider: meta.provider, quote: String(q.evidence_quote || "").slice(0, 300) })})
+                ${db.json({ model: meta.model, provider: meta.provider, quote: String(q.evidence_quote || "").slice(0, 300), phase: final ? "final" : "live" })})
         on conflict (session_id, dedupe_key) do nothing returning id`;
       if (row) { added++; existing.push({ id: row.id, text, state: "suggested" } as never); await emit(sessionId, s.workspace_id, "QuestionSuggested", { question_id: row.id }); }
     } catch (e) { if (!String((e as Error).message).startsWith("session_not_active")) throw e; return { added, skipped: "session_not_active" }; }

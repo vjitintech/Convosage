@@ -217,10 +217,27 @@ r.add("PATCH", "/v1/sessions/:id/status", async ({ req, params }) => {
   const ns = row.s as Record<string, unknown>;
   return json(req, { session_id: ns.id, status: ns.status, updated_at: ns.updated_at, updated_by: u.id, session_version: ns.version });
 });
-r.add("DELETE", "/v1/sessions/:id", async ({ req, params }) => {
+/** Permanently erase a session's content and mark it Deleted (legal hold respected). */
+async function purgeSession(sessionId: string, actor: string | null, reason: string) {
+  await db().begin(async (t) => {
+    const [s] = await t`select status, legal_hold, workspace_id from app.sessions where id = ${sessionId} for update`;
+    if (!s) return;
+    if (s.legal_hold) throw new HttpError(409, "legal_hold", "This session is under legal hold and cannot be deleted.");
+    if (s.status !== "deletion_pending") await t`select app.transition_session(${sessionId}, ${actor}, 'deletion_pending', ${reason})`;
+    await t`delete from app.transcript_segments where session_id = ${sessionId}`; await t`delete from app.visual_evidence where session_id = ${sessionId}`;
+    await t`delete from app.question_suggestions where session_id = ${sessionId}`; await t`delete from app.knowledge_artifacts where session_id = ${sessionId}`;
+    await t`delete from app.documents where session_id = ${sessionId}`; await t`delete from app.consents where session_id = ${sessionId}`;
+    await t`delete from app.jobs where session_id = ${sessionId}`; await t`delete from app.events where session_id = ${sessionId}`;
+    await t`select app.transition_session(${sessionId}, ${actor}, 'deleted', ${reason})`;
+    await t`select app.audit(${s.workspace_id}, ${actor}, 'session', ${sessionId}::text, 'session.purged', ${t.json({ reason })})`;
+  });
+}
+r.add("DELETE", "/v1/sessions/:id", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
+  const mode = url.searchParams.get("mode") || (config.deletionGraceDays === 0 ? "now" : "scheduled");
+  if (mode === "now") { await purgeSession(s.id, u.id, "user_requested"); return json(req, { session_id: s.id, status: "deleted", purged: true }); }
   const [row] = await db()`select app.transition_session(${s.id}, ${u.id}, 'deletion_pending', 'user_requested') as s`;
-  return json(req, { session_id: s.id, status: (row.s as Record<string, unknown>).status, purge_after_days: config.deletionGraceDays });
+  return json(req, { session_id: s.id, status: (row.s as Record<string, unknown>).status, purge_after_days: config.deletionGraceDays || 7 });
 });
 r.add("POST", "/v1/sessions/:id/restore", async ({ req, params }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
@@ -272,8 +289,15 @@ r.add("POST", "/v1/sessions/:id/capture/stop", async ({ req, params }) => {
   if (status === "stopped") {
     try { await emit(s.id, s.workspace_id, "CaptureStopped", { event_id: crypto.randomUUID(), session_id: s.id, capture_id: capId, stopped_at: rows[0].stopped_at, stop_reason: b.reason || "user_stopped", last_sequence: rows[0].last_sequence }); } catch { /* ignore */ }
     await auditLog(s.workspace_id, u.id, "capture", capId, "capture.stopped", { reason: b.reason || "user_stopped" });
+    // Whole-meeting wrap-up questions once the attendee stops capture (not when a session is disabled)
+    if (s.status === "active" && aiConfigured() && !String(b.reason || "").startsWith("session_") && (await entitlement(u.id)).active) {
+      try {
+        const [job] = await db()`insert into app.jobs (workspace_id, session_id, kind, payload, state) values (${s.workspace_id}, ${s.id}, 'questions', ${db().json({ actor: u.id, final: true })}, 'queued') returning *`;
+        background(runJob(job));
+      } catch { /* ignore */ }
+    }
   }
-  return json(req, { ok: true, status });
+  return json(req, { ok: true, status, wrap_up: status === "stopped" });
 });
 
 async function validateCapture(req: Request, u: AuthUser, sessionId: string) {
@@ -396,15 +420,15 @@ r.add("GET", "/v1/sessions/:id/visual", async ({ req, params }) => {
 // ---------------------------------------------------------------- questions
 r.add("GET", "/v1/sessions/:id/questions", async ({ req, params }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id));
-  const rows = await db()`select id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, state, answer_text, answer_refs, answer_confirmed, feedback, created_at, updated_at
+  const rows = await db()`select id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, state, answer_text, answer_refs, answer_confirmed, feedback, created_at, updated_at, coalesce(model_meta->>'phase','live') as phase
                           from app.question_suggestions where session_id = ${s.id} order by created_at desc limit 500`;
   return json(req, { questions: rows });
 });
-r.add("POST", "/v1/sessions/:id/questions/generate", async ({ req, params }) => {
+r.add("POST", "/v1/sessions/:id/questions/generate", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
   await requireEntitlement(u.id); await checkAiBudget(s.workspace_id, config.aiDailyCallLimit);
   if (s.status !== "active") throw new HttpError(409, "session_not_active", "Session is not Active.");
-  return json(req, await generateQuestions(s.id, u.id));
+  return json(req, await generateQuestions(s.id, u.id, { final: url.searchParams.get("final") === "1" }));
 });
 r.add("PATCH", "/v1/questions/:id", async ({ req, params }) => {
   const u = await me(req); const id = uuid(params.id);
@@ -523,8 +547,8 @@ async function runJob(job: Record<string, unknown>) {
   const claimed = await db()`update app.jobs set state = 'running', attempts = attempts + 1, updated_at = now() where id = ${id} and state in ('queued','failed') returning *`;
   if (!claimed.length) return;
   try {
-    const p = (job.payload || {}) as { actor?: string };
-    if (job.kind === "questions") await generateQuestions(job.session_id as string, p.actor || null);
+    const p = (job.payload || {}) as { actor?: string; final?: boolean };
+    if (job.kind === "questions") await generateQuestions(job.session_id as string, p.actor || null, { final: !!(p as { final?: boolean }).final });
     else if (job.kind === "knowledge") await generateKnowledge(job.session_id as string, p.actor || null);
     await db()`update app.jobs set state = 'done', updated_at = now() where id = ${id} and state = 'running'`;
   } catch (e) {
@@ -539,14 +563,7 @@ r.add("POST", "/v1/internal/run-jobs", async ({ req }) => {
   for (const j of jobs) await runJob(j);
   // Deletion: purge sessions pending deletion beyond the grace period (legal hold respected by the state machine)
   const purge = await db()`select id, workspace_id from app.sessions where status = 'deletion_pending' and not legal_hold and deletion_requested_at < now() - make_interval(days => ${config.deletionGraceDays}) limit 20`;
-  for (const s of purge) {
-    await db().begin(async (t) => {
-      await t`delete from app.transcript_segments where session_id = ${s.id}`; await t`delete from app.visual_evidence where session_id = ${s.id}`;
-      await t`delete from app.question_suggestions where session_id = ${s.id}`; await t`delete from app.knowledge_artifacts where session_id = ${s.id}`;
-      await t`delete from app.documents where session_id = ${s.id}`; await t`delete from app.events where session_id = ${s.id}`;
-      await t`select app.transition_session(${s.id}, null, 'deleted', 'retention_purge')`;
-    });
-  }
+  for (const s of purge) { try { await purgeSession(s.id, null, "retention_purge"); } catch (e) { console.error("purge failed", s.id, e); } }
   // Retention: expire documents past retention
   const expired = await db()`delete from app.documents where retention_until < now() returning id`;
   return json(req, { jobs: jobs.length, purged_sessions: purge.length, expired_documents: expired.length });
