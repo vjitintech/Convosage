@@ -30,7 +30,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       case "GET_TOKEN": return reply({ token: await accessToken(), endpoints: await endpoints() });
       case "GET_STATUS": return reply(status);
       case "CHOOSE_DESKTOP": {
-        chrome.desktopCapture.chooseDesktopMedia(["screen", "window", "tab"], (streamId) => reply({ streamId: streamId || null }));
+        const sources = (msg.audio ? ["tab", "screen", "window", "audio"] : ["screen", "window", "tab"]) as any[];
+        chrome.desktopCapture.chooseDesktopMedia(sources, (streamId, options) => reply({ streamId: streamId || null, canAudio: !!options?.canRequestAudioTrack }));
         return;
       }
       case "CAPTURE_START": {

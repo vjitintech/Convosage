@@ -196,28 +196,37 @@ function StartCapture({ s, onClose, onError }: { s: SessionRow; onClose: () => v
     setBusy(true); setMsg(null); onError(null);
     try {
       const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      let tabStreamId: string | null = null, desktopStreamId: string | null = null;
+      let tabStreamId: string | null = null, desktopStreamId: string | null = null, desktopAudio = false;
+      let needPickerAudio = false;
       if (tabAudio) {
-        if (!tab?.id || /^(chrome|edge|about|chrome-extension):/.test(tab.url || "")) throw new Error("Switch to the meeting tab (Zoom / Meet / Teams in this browser), click the CONVOSAGE toolbar icon there, then start capture.");
-        try { tabStreamId = await new Promise<string>((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, (id) => (chrome.runtime.lastError || !id ? rej(chrome.runtime.lastError) : res(id)))); }
-        catch { throw new Error("Chrome didn't allow tab audio. Click the CONVOSAGE toolbar icon while the meeting tab is in front, then try again."); }
+        const capturable = tab?.id && !/^(chrome|edge|about|chrome-extension|devtools):/.test(tab.url || "");
+        if (capturable) {
+          try { tabStreamId = await new Promise<string>((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: tab!.id! }, (id) => (chrome.runtime.lastError || !id ? rej(chrome.runtime.lastError) : res(id)))); }
+          catch { needPickerAudio = true; } // Chrome only allows direct tab capture right after the icon was clicked on that tab
+        } else needPickerAudio = true;
       }
       if (mic) {
         const p = await navigator.permissions.query({ name: "microphone" as PermissionName }).catch(() => null);
         if (!p || p.state !== "granted") { await chrome.tabs.create({ url: chrome.runtime.getURL("permission.html") }); setMsg("Allow the microphone in the tab that just opened, then press Start again."); setBusy(false); return; }
       }
-      if (screen) { const r = await chrome.runtime.sendMessage({ type: "CHOOSE_DESKTOP" }); desktopStreamId = r?.streamId || null; if (!desktopStreamId && !tabAudio && !mic) throw new Error("Screen selection was cancelled."); }
-      const sources = [tabAudio && "tab_audio", mic && "microphone", desktopStreamId && "display"].filter(Boolean) as string[];
+      if (screen || needPickerAudio) {
+        if (needPickerAudio) setMsg("Chrome's share window is open: pick the meeting TAB (or Entire screen on Windows) and tick “Share tab audio” / “Share system audio”.");
+        const r = await chrome.runtime.sendMessage({ type: "CHOOSE_DESKTOP", audio: needPickerAudio });
+        desktopStreamId = r?.streamId || null; desktopAudio = needPickerAudio && !!r?.canAudio;
+        if (needPickerAudio && desktopStreamId && !desktopAudio) throw new Error("No audio was shared. Start again, choose the meeting tab (or Entire screen on Windows) and tick “Share tab audio” / “Share system audio”.");
+        if (!desktopStreamId && !mic) throw new Error("Sharing was cancelled.");
+      }
+      const sources = [(tabStreamId || desktopAudio) && "tab_audio", mic && "microphone", desktopStreamId && screen && "display"].filter(Boolean) as string[];
       const cap = await api(`/v1/sessions/${s.id}/capture/start`, { body: { source_types: sources, consent: { accepted: true, statement: CONSENT }, browser_info: { ua: navigator.userAgent, platform: (navigator as any).userAgentData?.platform || navigator.platform }, permission_state: { tab_audio: !!tabStreamId, microphone: mic, display: !!desktopStreamId } } });
       const baseMs = s.started_at ? Math.max(0, Date.now() - new Date(s.started_at).getTime()) : 0;
-      const r = await chrome.runtime.sendMessage({ type: "CAPTURE_START", params: { sessionId: s.id, captureId: cap.capture_id, captureToken: cap.capture_token, expiresAt: cap.expires_at, baseMs, tabStreamId, desktopStreamId, mic } });
+      const r = await chrome.runtime.sendMessage({ type: "CAPTURE_START", params: { sessionId: s.id, captureId: cap.capture_id, captureToken: cap.capture_token, expiresAt: cap.expires_at, baseMs, tabStreamId, desktopStreamId, desktopAudio, desktopVideo: screen, mic } });
       if (!r?.ok) { await api(`/v1/sessions/${s.id}/capture/stop`, { body: { capture_id: cap.capture_id, reason: "start_failed" } }).catch(() => {}); throw new Error((r?.degraded || []).join(" ") || "Capture couldn't start."); }
       onClose();
     } catch (e) { setMsg((e as Error).message); } finally { setBusy(false); }
   };
   return <Modal title="Start capture" onClose={onClose}>
     <div className="small">Choose exactly what CONVOSAGE may capture. You can pause or stop at any time; the toolbar icon shows REC while capturing.</div>
-    <label className="chk"><input type="checkbox" checked={tabAudio} onChange={(e) => setTabAudio(e.target.checked)} /><span><b>Meeting tab audio</b><br /><span className="small">The meeting tab in front (Zoom / Meet / Teams web). You'll still hear the meeting.</span></span></label>
+    <label className="chk"><input type="checkbox" checked={tabAudio} onChange={(e) => setTabAudio(e.target.checked)} /><span><b>Meeting tab audio</b><br /><span className="small">Zoom / Meet / Teams in the browser. If Chrome asks, pick the meeting tab and tick “Share tab audio”. On Windows you can pick Entire screen + “Share system audio” to include the Zoom/Teams desktop apps.</span></span></label>
     <label className="chk"><input type="checkbox" checked={mic} onChange={(e) => setMic(e.target.checked)} /><span><b>My microphone</b><br /><span className="small">Your own voice, for in-person or hybrid sessions.</span></span></label>
     <label className="chk"><input type="checkbox" checked={screen} onChange={(e) => setScreen(e.target.checked)} /><span><b>Shared screen / slides</b><br /><span className="small">You'll pick one screen, window or tab. Frames are sampled when the view changes and read for slide text.</span></span></label>
     <label className="chk"><input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} /><span>{CONSENT}</span></label>

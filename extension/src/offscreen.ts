@@ -6,7 +6,7 @@
 import { CONFIG } from "./config";
 import type { CaptureStatus } from "./lib/types";
 
-interface StartParams { sessionId: string; captureId: string; captureToken: string; expiresAt: string; baseMs: number; tabStreamId?: string | null; desktopStreamId?: string | null; mic?: boolean }
+interface StartParams { sessionId: string; captureId: string; captureToken: string; expiresAt: string; baseMs: number; tabStreamId?: string | null; desktopStreamId?: string | null; desktopAudio?: boolean; desktopVideo?: boolean; mic?: boolean }
 type Item = { kind: "audio" | "frame"; source: string; seq: number; startMs: number; endMs: number; blob: Blob; tries: number };
 
 let P: StartParams | null = null;
@@ -119,8 +119,18 @@ async function start(p: StartParams) {
     catch { degraded.push("Microphone blocked — allow it from the capture options"); }
   }
   if (p.desktopStreamId) {
-    try { const s = await navigator.mediaDevices.getUserMedia({ audio: false, video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: p.desktopStreamId, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 5 } } as any }); streams.push(s); frameLoop(s); watchEnded(s, "Screen share"); sources.push("display"); }
-    catch { degraded.push("Screen capture was not started"); }
+    try {
+      const want = p.desktopVideo !== false;
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: p.desktopAudio ? ({ mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: p.desktopStreamId } } as any) : false,
+        video: { mandatory: { chromeMediaSource: "desktop", chromeMediaSourceId: p.desktopStreamId, maxWidth: 1920, maxHeight: 1080, maxFrameRate: 5 } } as any });
+      streams.push(s);
+      const aud = s.getAudioTracks();
+      if (aud.length) { const a = new MediaStream(aud); streams.push(a); audioSources.set(a, "tab_audio"); audioLoop(a, "tab_audio"); watchEnded(a, "Shared audio"); sources.push("tab_audio"); }
+      else if (p.desktopAudio) degraded.push("No audio was shared — pick the meeting tab (or Entire screen on Windows) and tick “Share tab audio” / “Share system audio”");
+      if (want) { const v = new MediaStream(s.getVideoTracks()); frameLoop(v); watchEnded(v, "Screen share"); sources.push("display"); }
+      else s.getVideoTracks().forEach((t) => t.stop());
+    } catch { degraded.push("Screen/audio sharing was not started"); }
   }
   if (!sources.length) { await stop("no_sources", false); push({ degraded, lastError: "No capture source could be started." }); return { ok: false, degraded }; }
   scheduleRefresh();
