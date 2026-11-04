@@ -62,3 +62,20 @@ For customers, install from the Chrome Web Store or Edge Add-ons, or via your or
 - Screen capture uses bandwidth, battery and CPU.
 - Speakers are labelled "Unknown speaker" unless known; voice-based identification isn't attempted.
 - AI output can be wrong. Evidence and human review remain necessary.
+
+## Questions during and after the meeting
+- Questions appear **live** while capture runs. Filter with **To ask / Wrap-up / Answered / Dismissed / All**.
+- Audio (tab or system audio, plus optional mic), uploaded transcripts and on-screen content all feed the same session. This works the same for a live meeting and for a recording played in the browser.
+- When you press **Stop capture**, Convosage reviews the **whole meeting** and adds up to 6 **wrap-up** questions (tagged "wrap-up"). You can also press **Wrap-up questions** at any time.
+
+## Deleting a session
+**Delete permanently** erases the transcript, questions, knowledge and documents immediately. An audit record is kept. Sessions under legal hold can't be deleted. To keep an undo window instead, set `DELETION_GRACE_DAYS` (for example 7) in the server secrets.
+
+## Any language in, English out
+- Speech, captions, uploaded transcripts and on-screen text can be in any language. The transcript is shown in English; hover "(translated)" to see the original wording.
+- Questions, answers and wrap-up questions are always written in English.
+- Silence and background noise are not sent for transcription, and phrases speech-to-text tends to invent from silence (e.g. "Thank you for watching", "Terima kasih") are filtered out.
+- To force one spoken language, set `ASR_LANGUAGE` (e.g. `en`) in the server secrets. Leave it empty to auto-detect.
+
+## What the side panel shows
+Only what exists: question groups (To ask / Wrap-up / Answered / Dismissed / All) appear with counts once they have questions. The transcript is a collapsed section underneath. Live questions also draw on documents uploaded to the session or programme and on Q&A from earlier sessions.

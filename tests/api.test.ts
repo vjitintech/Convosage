@@ -24,9 +24,10 @@ const { handler: webhook } = await import("../supabase/functions/razorpay-webhoo
 const { sql } = await import("../supabase/functions/_shared/db.ts");
 
 // Fresh schema
-const migration = await Deno.readTextFile(new URL("../supabase/migrations/20261103000001_core.sql", import.meta.url));
 await sql().unsafe("drop schema if exists app cascade");
-await sql().unsafe(migration);
+const migDir = new URL("../supabase/migrations/", import.meta.url);
+const migs = [...Deno.readDirSync(migDir)].map((e) => e.name).filter((n) => n.endsWith(".sql")).sort();
+for (const m of migs) await sql().unsafe(await Deno.readTextFile(new URL(m, migDir)));
 
 const secret = new TextEncoder().encode(Deno.env.get("SUPABASE_JWT_SECRET")!);
 async function token(sub: string, phone: string) {
@@ -161,6 +162,18 @@ Deno.test({ name: "knowledge continuity + cross-session ask with citations", san
   assertEquals(a.status, 200); assert(a.body.citations.length >= 1 && a.body.citations[0].session_title, "cited session + timestamp");
 }});
 
+Deno.test({ name: "wrap-up: stopping capture reviews the whole meeting and adds final questions", sanitizeResources: false, sanitizeOps: false, fn: async () => {
+  const st = await call(A, "POST", `/v1/sessions/${sessA}/capture/stop`, { capture_id: capId, reason: "user_stopped" });
+  assertEquals(st.body.wrap_up, true);
+  let fin: any[] = [];
+  for (let i = 0; i < 20 && fin.length < 2; i++) { await wait(300); fin = (await call(A, "GET", `/v1/sessions/${sessA}/questions`)).body.questions.filter((q: any) => q.phase === "final"); }
+  assertEquals(fin.length, 2, "two wrap-up questions");
+  assert(fin.every((q: any) => q.rationale), "wrap-up questions explain why");
+  // restart capture for the following tests
+  const r = await call(A, "POST", `/v1/sessions/${sessA}/capture/start`, { source_types: ["tab_audio"], consent: { accepted: true, statement: "ok" } });
+  capId = r.body.capture_id; capTok = r.body.capture_token;
+}});
+
 Deno.test({ name: "disable during capture: stops capture, revokes token, blocks media/jobs; re-enable never resumes (F-02..F-05)", sanitizeResources: false, sanitizeOps: false, fn: async () => {
   const d = await call(A, "PATCH", `/v1/sessions/${sessA}/status`, { status: "disabled", reason_code: "user_requested" });
   assertEquals(d.status, 200); assertEquals(d.body.status, "disabled"); assert(d.body.session_version > 1);
@@ -194,8 +207,19 @@ Deno.test({ name: "archive → read-only; delete → pending; legal hold; restor
   assertEquals((await call(A, "PATCH", `/v1/sessions/${s2}/status`, { status: "archived" })).body.status, "archived");
   assertEquals((await call(A, "PATCH", `/v1/sessions/${s2}`, { title: "x" })).status, 409);
   assertEquals((await call(A, "PATCH", `/v1/sessions/${s2}/status`, { status: "active" })).status, 409);
-  assertEquals((await call(A, "DELETE", `/v1/sessions/${s2}`)).body.status, "deletion_pending");
+  assertEquals((await call(A, "DELETE", `/v1/sessions/${s2}?mode=scheduled`)).body.status, "deletion_pending");
   assertEquals((await call(A, "POST", `/v1/sessions/${s2}/restore`)).body.status, "archived");
+}});
+
+Deno.test({ name: "delete: erases the session immediately by default (content purged, audited)", sanitizeResources: false, sanitizeOps: false, fn: async () => {
+  const s3 = (await call(A, "POST", "/v1/sessions", { programme_id: progA, title: "To delete" })).body.id;
+  await call(A, "POST", `/v1/sessions/${s3}/segments`, { segments: [{ start_ms: 0, text: "Confidential detail to erase" }] });
+  const d = await call(A, "DELETE", `/v1/sessions/${s3}`);
+  assertEquals(d.body.status, "deleted"); assertEquals(d.body.purged, true);
+  assertEquals((await call(A, "GET", `/v1/sessions/${s3}`)).status, 404);
+  const [{ n }] = await sql()`select count(*)::int n from app.transcript_segments where session_id = ${s3}`; assertEquals(n, 0);
+  assert(!(await call(A, "GET", `/v1/sessions?programme_id=${progA}`)).body.sessions.some((x: any) => x.id === s3));
+  const [{ a }] = await sql()`select count(*)::int a from app.audit_events where action = 'session.purged' and target_id = ${s3}`; assertEquals(a, 1);
 }});
 
 Deno.test({ name: "razorpay webhook: signature verified, idempotent, activates subscription", sanitizeResources: false, sanitizeOps: false, fn: async () => {
@@ -219,3 +243,13 @@ Deno.test({ name: "audit trail is hash-chained and tamper-evident", sanitizeReso
   let threw = false; try { await sql()`delete from app.audit_events where id = ${rows[0].id}`; } catch { threw = true; } assert(threw);
   await sql().end();
 }});
+
+Deno.test("speech filter: Whisper silence phantoms are dropped; language detection for uploads", async () => {
+  const { isLikelyHallucination, looksEnglish, isEnglish } = await import("../supabase/functions/_shared/model.ts");
+  for (const t of ["Terima kasih.", "E aí", "Thank you for watching!", "Obrigado.", "you", "Subtitles by the Amara.org community"]) assert(isLikelyHallucination(t), t);
+  for (const t of ["The nightly batch restarts from the top.", "I'm going to go through the runbook now."]) assert(!isLikelyHallucination(t), t);
+  assert(looksEnglish("We will move the extract after the payment run is done"));
+  assert(!looksEnglish("A gente vai fazer uma coisa que eu vou fazer amanhã com o time"));
+  assert(!looksEnglish("आज हम भुगतान प्रक्रिया के बारे में बात करेंगे"));
+  assert(isEnglish("english") && isEnglish("en") && !isEnglish("portuguese"));
+});

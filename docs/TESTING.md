@@ -51,3 +51,18 @@ Real customers' numbers go to Razorpay's hosted checkout instead. While you stil
   This loads the built extension in Chromium and walks through 20 checks: setup notice, OTP login (wrong and correct), paywall, declined and successful dummy payment, MCP setup, session create, no counts in the UI, transcript import, live questions via events, answer capture, knowledge, ask, Markdown and PDF export, disable/enable, the capture consent gate, and second-user isolation.
 
 Not covered by automation (needs real accounts and devices): live Twilio SMS, live Razorpay charges and payouts, and real tab/screen capture inside a meeting.
+
+## Full local end-to-end (real extension, real tab capture)
+```bash
+cd extension && npm run build && cd ..
+bash tests/run-e2e.sh            # both suites; or: bash tests/run-e2e.sh tests/e2e-capture.mjs
+```
+`e2e-capture.mjs` opens a "meeting" tab that plays audio and shows a slide, starts capture on that tab (audio + what is shown, no microphone), and checks: tab audio is transcribed, the screen is read, live questions appear with group counts, stopping adds wrap-up questions, and **Delete permanently** erases everything at once.
+
+Run the capture test the way production is configured with Gemini (OpenAI-compatible endpoint), and with a rejected key:
+```bash
+AI_MODE=gemini bash tests/run-e2e.sh tests/e2e-capture.mjs   # native Gemini (AQ. keys)
+AI_MODE=openai bash tests/run-e2e.sh tests/e2e-capture.mjs   # OpenAI-compatible
+AI_MODE=openai KEY=bad-key EXPECT_BAD_KEY=1 bash tests/run-e2e.sh tests/e2e-capture.mjs
+```
+In the app, **Settings → Check AI setup** tests the text model, screen reading and speech-to-text against your real keys.

@@ -5,7 +5,8 @@ Environments, per blueprint §8: **Local** (synthetic data) → **Staging** (pro
 ## 1. Supabase project
 1. Create a project at supabase.com. For Indian customers, pick a region close to them, such as Mumbai `ap-south-1`.
 2. Install the Supabase CLI, then run:
-   `supabase login` · `supabase link --project-ref <ref>` · `supabase db push`
+   `supabase login` · `supabase link --project-ref <ref>` · `supabase db push --remote`
+   (newer CLI versions target a local stack unless you pass `--remote`; add `--project-ref <ref>` to `secrets set` and `functions deploy` too)
    This creates schema `app` with every table, the session state machine, guards and the audit chain.
 3. Push the auth settings with `supabase config push` (phone OTP, Twilio Verify, test numbers, token rotation). You can also set them in the Dashboard → Authentication → Providers → **Phone**:
    - Enable Phone provider. SMS provider: **Twilio Verify**.

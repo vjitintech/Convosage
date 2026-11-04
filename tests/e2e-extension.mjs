@@ -1,5 +1,5 @@
 // End-to-end: real extension (unpacked) in Chromium + local API + mock auth/AI + real MCP server.
-let pw; try { pw = (await import("playwright")).default; } catch { pw = (await import("/opt/npm-tools/node_modules/playwright/index.js")).default; }
+let pw; try { pw = (await import("/opt/npm-tools/node_modules/playwright/index.js")).default; } catch { pw = (await import("playwright")).default; }
 const { chromium } = pw;
 import fs from "node:fs";
 const EXT = new URL("../extension/dist", import.meta.url).pathname;
@@ -91,7 +91,7 @@ await page.waitForSelector("text=Disable session"); log("re-enabled (capture not
 const rec = await page.locator(".rec").count(); if (rec) throw new Error("capture indicator present after re-enable");
 
 // --- capture start dialog renders consent + sources
-await page.getByRole("button", { name: "● Start capture" }).click(); await page.waitForSelector("text=Meeting tab audio");
+await page.getByRole("button", { name: "● Start capture" }).click(); await page.waitForSelector("text=What is said");
 if (!(await page.getByRole("dialog").getByRole("button", { name: "Start capture" }).isDisabled())) throw new Error("must require consent");
 await shot(page, "07-capture-consent"); await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click(); log("capture requires explicit consent");
 

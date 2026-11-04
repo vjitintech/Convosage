@@ -6,7 +6,7 @@ import { authenticate, type AuthUser } from "../_shared/auth.ts";
 import { background, bad, corsHeaders, errorResponse, forbidden, HttpError, json, oneOf, randomToken, rateLimit, readBytes, readJson, Router, sha256Hex, str, text, uuid } from "../_shared/http.ts";
 import { bootstrapUser, checkAiBudget, DEFAULT_CONTEXT, entitlement, requireEntitlement, requireProgramme, requireSession, requireWorkspace } from "../_shared/access.ts";
 import { cancelSubscription, completeMockPayment, createSubscription, providerFor } from "../_shared/billing.ts";
-import { connectMcp, encryptSecret, readFrame, transcribe } from "../_shared/model.ts";
+import { aiError, chat, connectMcp, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
 import { ask, generateKnowledge, generateQuestions, inferContext, jaccard, latestContext } from "../_shared/intelligence.ts";
 import { redact } from "../_shared/redact.ts";
 
@@ -30,6 +30,36 @@ function sessionView(s: Record<string, unknown>) {
 r.add("GET", "/v1/health", async ({ req }) => {
   let dbOk = false; try { await db()`select 1`; dbOk = true; } catch { /* ignore */ }
   return json(req, { ok: dbOk, ai: aiConfigured(), asr: asrConfigured(), billing: config.billingProvider, version: "2.0.0" });
+});
+
+// Self-check of the AI setup (text model, screen reading, speech-to-text) — used by Settings → "Check AI setup".
+r.add("GET", "/v1/diagnostics", async ({ req }) => {
+  const u = await me(req);
+  const [m] = await db()`select workspace_id from app.memberships where user_id = ${u.id} limit 1`;
+  const ws = m?.workspace_id as string;
+  const out: Record<string, { ok: boolean; detail: string }> = {};
+  const t0 = Date.now();
+  try { const r = await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", maxTokens: 50 }); out.text_model = { ok: /ok/.test(r.text), detail: `${config.modelName} answered in ${Date.now() - t0} ms` }; }
+  catch (e) { out.text_model = { ok: false, detail: aiError(e).message }; }
+  if (config.modelNameLarge !== config.modelName) {
+    try { await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", large: true, maxTokens: 50 }); out.large_model = { ok: true, detail: `${config.modelNameLarge} OK` }; }
+    catch (e) { out.large_model = { ok: false, detail: aiError(e).message }; }
+  }
+  try {
+    // 64×32 white JPEG — checks that the vision model accepts images.
+    const jpg = Uint8Array.from(atob("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgUFBcUFxsbGxsbGyAeICEhISAgICAhISEkJCQqKiokJCQhISQkKCgqKi4vLisrKisvLzIyMjw8OTlGRkhWVmf/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIACAAQAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AAAAAAAAAAAAAAAD/2Q=="), (c) => c.charCodeAt(0));
+    await readFrame(jpg, ws, u.id); out.screen_reading = { ok: true, detail: `${config.visionModel} accepted an image` };
+  } catch (e) { out.screen_reading = { ok: false, detail: aiError(e, "vision").message }; }
+  if (!asrConfigured()) out.speech_to_text = { ok: false, detail: "ASR_BASE_URL / ASR_API_KEY are not set." };
+  else {
+    try {
+      // 1 s of silence as WAV — a working speech-to-text returns an (empty) result.
+      const n = 16000, b = new ArrayBuffer(44 + n * 2), d = new DataView(b), w = (o: number, s: string) => [...s].forEach((c, i) => d.setUint8(o + i, c.charCodeAt(0)));
+      w(0, "RIFF"); d.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt "); d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true); d.setUint32(24, 16000, true); d.setUint32(28, 32000, true); d.setUint16(32, 2, true); d.setUint16(34, 16, true); w(36, "data"); d.setUint32(40, n * 2, true);
+      await transcribe(new Uint8Array(b), "audio/wav"); out.speech_to_text = { ok: true, detail: `${config.asrModel} OK` };
+    } catch (e) { out.speech_to_text = { ok: false, detail: String((e as Error).message).slice(0, 300) + " — check ASR_BASE_URL / ASR_API_KEY / ASR_MODEL." }; }
+  }
+  return json(req, { checks: out, ok: Object.values(out).every((c) => c.ok) });
 });
 
 r.add("GET", "/v1/me", async ({ req }) => {
@@ -217,10 +247,28 @@ r.add("PATCH", "/v1/sessions/:id/status", async ({ req, params }) => {
   const ns = row.s as Record<string, unknown>;
   return json(req, { session_id: ns.id, status: ns.status, updated_at: ns.updated_at, updated_by: u.id, session_version: ns.version });
 });
-r.add("DELETE", "/v1/sessions/:id", async ({ req, params }) => {
+/** Permanently erase a session's content and mark it Deleted (legal hold respected). */
+async function purgeSession(sessionId: string, actor: string | null, reason: string) {
+  await db().begin(async (t) => {
+    const [s] = await t`select status, legal_hold, workspace_id from app.sessions where id = ${sessionId} for update`;
+    if (!s) return;
+    if (s.legal_hold) throw new HttpError(409, "legal_hold", "This session is under legal hold and cannot be deleted.");
+    if (s.status !== "deletion_pending") await t`select app.transition_session(${sessionId}, ${actor}, 'deletion_pending', ${reason})`;
+    await t`delete from app.transcript_segments where session_id = ${sessionId}`; await t`delete from app.visual_evidence where session_id = ${sessionId}`;
+    await t`delete from app.question_suggestions where session_id = ${sessionId}`; await t`delete from app.knowledge_artifacts where session_id = ${sessionId}`;
+    await t`delete from app.documents where session_id = ${sessionId}`; await t`delete from app.consents where session_id = ${sessionId}`;
+    await t`delete from app.jobs where session_id = ${sessionId}`; await t`delete from app.events where session_id = ${sessionId}`;
+    await t`select app.transition_session(${sessionId}, ${actor}, 'deleted', ${reason})`;
+    await t`select app.audit(${s.workspace_id}, ${actor}, 'session', ${sessionId}::text, 'session.purged', ${t.json({ reason })})`;
+  });
+}
+r.add("DELETE", "/v1/sessions/:id", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
+  // Delete means delete: erase now. A grace period is only used when explicitly asked for (?mode=scheduled).
+  const mode = url.searchParams.get("mode") === "scheduled" ? "scheduled" : "now";
+  if (mode === "now") { await purgeSession(s.id, u.id, "user_requested"); return json(req, { session_id: s.id, status: "deleted", purged: true }); }
   const [row] = await db()`select app.transition_session(${s.id}, ${u.id}, 'deletion_pending', 'user_requested') as s`;
-  return json(req, { session_id: s.id, status: (row.s as Record<string, unknown>).status, purge_after_days: config.deletionGraceDays });
+  return json(req, { session_id: s.id, status: (row.s as Record<string, unknown>).status, purge_after_days: config.deletionGraceDays || 7 });
 });
 r.add("POST", "/v1/sessions/:id/restore", async ({ req, params }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
@@ -272,8 +320,15 @@ r.add("POST", "/v1/sessions/:id/capture/stop", async ({ req, params }) => {
   if (status === "stopped") {
     try { await emit(s.id, s.workspace_id, "CaptureStopped", { event_id: crypto.randomUUID(), session_id: s.id, capture_id: capId, stopped_at: rows[0].stopped_at, stop_reason: b.reason || "user_stopped", last_sequence: rows[0].last_sequence }); } catch { /* ignore */ }
     await auditLog(s.workspace_id, u.id, "capture", capId, "capture.stopped", { reason: b.reason || "user_stopped" });
+    // Whole-meeting wrap-up questions once the attendee stops capture (not when a session is disabled)
+    if (s.status === "active" && aiConfigured() && !String(b.reason || "").startsWith("session_") && (await entitlement(u.id)).active) {
+      try {
+        const [job] = await db()`insert into app.jobs (workspace_id, session_id, kind, payload, state) values (${s.workspace_id}, ${s.id}, 'questions', ${db().json({ actor: u.id, final: true })}, 'queued') returning *`;
+        background(runJob(job));
+      } catch { /* ignore */ }
+    }
   }
-  return json(req, { ok: true, status });
+  return json(req, { ok: true, status, wrap_up: status === "stopped" });
 });
 
 async function validateCapture(req: Request, u: AuthUser, sessionId: string) {
@@ -315,15 +370,22 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
     if (kind === "audio") {
       if (!asrConfigured()) throw new HttpError(503, "asr_unconfigured", "Speech-to-text is not configured on the server yet.");
       const bytes = await readBytes(req, config.maxAudioChunkBytes);
-      const segs = await transcribe(bytes, req.headers.get("content-type") || "audio/webm");
-      for (const g of segs) {
-        await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source)
-                   values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs + Math.round(g.start * 1000)}, ${startMs + Math.round(Math.max(g.end, g.start) * 1000)}, ${g.text.slice(0, 4000)}, ${source === "microphone" ? "You (microphone)" : "Unknown speaker"}, ${g.confidence}, ${source})`;
+      const asr = await transcribe(bytes, req.headers.get("content-type") || "audio/webm");
+      const english = isEnglish(asr.language) || asr.segments.every((g) => looksEnglish(g.text));
+      const texts = english ? asr.segments.map((g) => g.text) : await translateToEnglish(asr.segments.map((g) => g.text), s.workspace_id, u.id, asr.language);
+      for (let i = 0; i < asr.segments.length; i++) {
+        const g = asr.segments[i]; const text = texts[i].trim(); if (!text) continue;
+        await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source, language, original_text)
+                   values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs + Math.round(g.start * 1000)}, ${startMs + Math.round(Math.max(g.end, g.start) * 1000)}, ${text.slice(0, 4000)}, ${source === "microphone" ? "You (microphone)" : "Unknown speaker"}, ${g.confidence}, ${source},
+                           ${english ? "en" : asr.language || null}, ${english || text === g.text ? null : g.text.slice(0, 4000)})`;
         inserted++;
       }
     } else if (kind === "captions") {
-      const txt = new TextDecoder().decode(await readBytes(req, 20_000)).trim();
-      if (txt) { await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source) values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs}, ${endMs}, ${txt.slice(0, 4000)}, ${str(req.headers.get("x-speaker"), "speaker", 80, false) || "Unknown speaker"}, null, 'captions')`; inserted++; }
+      let txt = new TextDecoder().decode(await readBytes(req, 20_000)).trim();
+      const orig = txt; if (txt && !looksEnglish(txt)) txt = (await translateToEnglish([txt], s.workspace_id, u.id))[0].trim();
+      if (txt) { await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source) values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs}, ${endMs}, ${txt.slice(0, 4000)}, ${str(req.headers.get("x-speaker"), "speaker", 80, false) || "Unknown speaker"}, null, 'captions')`;
+        if (orig !== txt) await db()`update app.transcript_segments set original_text = ${orig.slice(0, 4000)}, language = 'auto' where id = (select max(id) from app.transcript_segments where session_id = ${s.id})`;
+        inserted++; }
     } else {
       if (!aiConfigured()) throw new HttpError(503, "ai_unconfigured", "AI is not configured on the server yet.");
       const bytes = await readBytes(req, config.maxFrameBytes);
@@ -331,7 +393,7 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
       const v = await readFrame(bytes, s.workspace_id, u.id);
       const last = await db()`select title, extracted_text from app.visual_evidence where session_id = ${s.id} order by timestamp_ms desc limit 1`;
       const transition = !last.length || jaccard(String(last[0].title || "") + " " + String(last[0].extracted_text || ""), v.title + " " + v.text) < 0.6;
-      if (v.text || v.title) { await db()`insert into app.visual_evidence (session_id, workspace_id, capture_id, timestamp_ms, extracted_text, type, title, is_transition, confidence) values (${s.id}, ${s.workspace_id}, ${c.id}, ${startMs}, ${v.text}, ${v.type}, ${v.title || null}, ${transition}, ${v.confidence})`; inserted++; }
+      if (v.text || v.title) { await db()`insert into app.visual_evidence (session_id, workspace_id, capture_id, timestamp_ms, extracted_text, type, title, is_transition, confidence, language) values (${s.id}, ${s.workspace_id}, ${c.id}, ${startMs}, ${v.text}, ${v.type}, ${v.title || null}, ${transition}, ${v.confidence}, ${v.language || null})`; inserted++; }
     }
     await db()`update app.jobs set state = 'done', updated_at = now() where id = ${job.id}`;
     await db()`update app.captures set last_sequence = greatest(last_sequence, ${seq}) where id = ${c.id}`;
@@ -339,7 +401,10 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
   } catch (e) {
     await db()`update app.jobs set state = 'failed', last_error = ${String((e as Error).message).slice(0, 300)}, updated_at = now() where id = ${job.id}`;
     try { await emit(s.id, s.workspace_id, "MediaFailed", { capture_id: c.id, seq, kind, error: (e as HttpError).code || "processing_failed" }); } catch { /* session may have been disabled */ }
-    throw e;
+    if (e instanceof HttpError) throw e;
+    const raw = String((e as Error).message || "").slice(0, 240);
+    if (kind === "audio") throw new HttpError(502, "asr_failed", "Speech-to-text failed (" + raw + "). Check ASR_BASE_URL / ASR_API_KEY / ASR_MODEL and the provider's credit.");
+    throw new HttpError(502, "vision_failed", "Reading the screen failed (" + raw + "). Check MODEL_* / VISION_MODEL settings.");
   }
   if (inserted) await maybeQueueQuestions(s.id, s.workspace_id, u.id);
   return json(req, { ok: true, inserted });
@@ -353,10 +418,18 @@ r.add("POST", "/v1/sessions/:id/segments", async ({ req, params }) => {
   const source = b.source === "upload" ? "upload" : "manual";
   const segs = (Array.isArray(b.segments) ? b.segments : []).slice(0, 2000);
   let n = 0;
-  for (const g of segs) {
-    const t = String(g.text || "").trim(); if (!t) continue;
+  // Uploaded transcripts in any language are translated to English (original kept) in batches of 40 lines.
+  const rows = segs.map((g) => ({ g, t: String(g.text || "").trim() })).filter((x) => x.t);
+  const foreign = rows.filter((x) => !looksEnglish(x.t));
+  const translated = new Map<number, string>();
+  if (foreign.length && aiConfigured()) for (let i = 0; i < foreign.length && i < 800; i += 40) {
+    const batch = foreign.slice(i, i + 40); const out = await translateToEnglish(batch.map((x) => x.t), s.workspace_id, u.id);
+    batch.forEach((x, k) => translated.set(rows.indexOf(x), out[k]));
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const { g, t } = rows[i]; const en = (translated.get(i) ?? t).trim() || t;
     const st = Math.max(0, Math.round(Number(g.start_ms) || 0));
-    await db()`insert into app.transcript_segments (session_id, workspace_id, seq, start_ms, end_ms, text, speaker_label, source) values (${s.id}, ${s.workspace_id}, 0, ${st}, ${Math.max(st, Math.round(Number(g.end_ms) || st))}, ${t.slice(0, 4000)}, ${String(g.speaker_label || "Unknown speaker").slice(0, 80)}, ${source})`;
+    await db()`insert into app.transcript_segments (session_id, workspace_id, seq, start_ms, end_ms, text, speaker_label, source, language, original_text) values (${s.id}, ${s.workspace_id}, 0, ${st}, ${Math.max(st, Math.round(Number(g.end_ms) || st))}, ${en.slice(0, 4000)}, ${String(g.speaker_label || "Unknown speaker").slice(0, 80)}, ${source}, ${en !== t ? "auto" : null}, ${en !== t ? t.slice(0, 4000) : null})`;
     n++;
   }
   if (n) { await emit(s.id, s.workspace_id, "TranscriptAdded", { count: n, source }); await auditLog(s.workspace_id, u.id, "session", s.id, "transcript.imported", { segments: n, source }); if (await entitlement(u.id).then((e) => e.active)) await maybeQueueQuestions(s.id, s.workspace_id, u.id); }
@@ -381,7 +454,7 @@ r.add("GET", "/v1/sessions/:id/events", async ({ req, params, url }) => {
 r.add("GET", "/v1/sessions/:id/transcript", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id));
   const after = Number(url.searchParams.get("after_id") || 0);
-  const rows = await db()`select id, start_ms, end_ms, text, speaker_label, confidence, source, capture_id from app.transcript_segments where session_id = ${s.id} and id > ${after} order by start_ms, id limit 2000`;
+  const rows = await db()`select id, start_ms, end_ms, text, speaker_label, confidence, source, capture_id, language, original_text from app.transcript_segments where session_id = ${s.id} and id > ${after} order by start_ms, id limit 2000`;
   return json(req, { segments: rows });
 });
 r.add("GET", "/v1/sessions/:id/visual", async ({ req, params }) => {
@@ -393,15 +466,18 @@ r.add("GET", "/v1/sessions/:id/visual", async ({ req, params }) => {
 // ---------------------------------------------------------------- questions
 r.add("GET", "/v1/sessions/:id/questions", async ({ req, params }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id));
-  const rows = await db()`select id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, state, answer_text, answer_refs, answer_confirmed, feedback, created_at, updated_at
+  const rows = await db()`select id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, state, answer_text, answer_refs, answer_confirmed, feedback, created_at, updated_at, coalesce(model_meta->>'phase','live') as phase
                           from app.question_suggestions where session_id = ${s.id} order by created_at desc limit 500`;
-  return json(req, { questions: rows });
+  // If the most recent question run failed (e.g. AI key/quota problem), say why instead of showing nothing.
+  const [last] = await db()`select state, last_error, updated_at from app.jobs where session_id = ${s.id} and kind = 'questions' and state <> 'queued' and state <> 'running' order by updated_at desc limit 1`;
+  const problem = last && (last.state === "failed" || last.state === "dead") && Date.now() - new Date(last.updated_at).getTime() < 15 * 60_000 ? String(last.last_error || "Question generation failed.") : null;
+  return json(req, { questions: rows, problem });
 });
-r.add("POST", "/v1/sessions/:id/questions/generate", async ({ req, params }) => {
+r.add("POST", "/v1/sessions/:id/questions/generate", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");
   await requireEntitlement(u.id); await checkAiBudget(s.workspace_id, config.aiDailyCallLimit);
   if (s.status !== "active") throw new HttpError(409, "session_not_active", "Session is not Active.");
-  return json(req, await generateQuestions(s.id, u.id));
+  return json(req, await generateQuestions(s.id, u.id, { final: url.searchParams.get("final") === "1" }));
 });
 r.add("PATCH", "/v1/questions/:id", async ({ req, params }) => {
   const u = await me(req); const id = uuid(params.id);
@@ -520,8 +596,8 @@ async function runJob(job: Record<string, unknown>) {
   const claimed = await db()`update app.jobs set state = 'running', attempts = attempts + 1, updated_at = now() where id = ${id} and state in ('queued','failed') returning *`;
   if (!claimed.length) return;
   try {
-    const p = (job.payload || {}) as { actor?: string };
-    if (job.kind === "questions") await generateQuestions(job.session_id as string, p.actor || null);
+    const p = (job.payload || {}) as { actor?: string; final?: boolean };
+    if (job.kind === "questions") await generateQuestions(job.session_id as string, p.actor || null, { final: !!(p as { final?: boolean }).final });
     else if (job.kind === "knowledge") await generateKnowledge(job.session_id as string, p.actor || null);
     await db()`update app.jobs set state = 'done', updated_at = now() where id = ${id} and state = 'running'`;
   } catch (e) {
@@ -536,14 +612,7 @@ r.add("POST", "/v1/internal/run-jobs", async ({ req }) => {
   for (const j of jobs) await runJob(j);
   // Deletion: purge sessions pending deletion beyond the grace period (legal hold respected by the state machine)
   const purge = await db()`select id, workspace_id from app.sessions where status = 'deletion_pending' and not legal_hold and deletion_requested_at < now() - make_interval(days => ${config.deletionGraceDays}) limit 20`;
-  for (const s of purge) {
-    await db().begin(async (t) => {
-      await t`delete from app.transcript_segments where session_id = ${s.id}`; await t`delete from app.visual_evidence where session_id = ${s.id}`;
-      await t`delete from app.question_suggestions where session_id = ${s.id}`; await t`delete from app.knowledge_artifacts where session_id = ${s.id}`;
-      await t`delete from app.documents where session_id = ${s.id}`; await t`delete from app.events where session_id = ${s.id}`;
-      await t`select app.transition_session(${s.id}, null, 'deleted', 'retention_purge')`;
-    });
-  }
+  for (const s of purge) { try { await purgeSession(s.id, null, "retention_purge"); } catch (e) { console.error("purge failed", s.id, e); } }
   // Retention: expire documents past retention
   const expired = await db()`delete from app.documents where retention_until < now() returning id`;
   return json(req, { jobs: jobs.length, purged_sessions: purge.length, expired_documents: expired.length });

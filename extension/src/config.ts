@@ -22,4 +22,6 @@ export const CONFIG = {
   FRAME_SAMPLE_MS: 2000,
   /** Force a frame upload at least this often while the screen is static */
   FRAME_MAX_INTERVAL_MS: 60000,
+  /** Never read the screen more often than this (videos change every frame; slides don't) */
+  FRAME_MIN_INTERVAL_MS: 20000,
 };

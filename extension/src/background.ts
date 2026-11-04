@@ -8,6 +8,7 @@ chrome.runtime.onInstalled.addListener(() => { chrome.sidePanel.setPanelBehavior
 chrome.runtime.onStartup.addListener(() => { chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {}); });
 
 let status: CaptureStatus = { state: "idle", sources: [], queued: 0, uploaded: 0, failed: 0, degraded: [] };
+let engineHost: "offscreen" | "panel" = "offscreen"; // where the running capture lives
 
 async function ensureOffscreen() {
   const ctx = await chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT] });
@@ -30,7 +31,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       case "GET_TOKEN": return reply({ token: await accessToken(), endpoints: await endpoints() });
       case "GET_STATUS": return reply(status);
       case "CHOOSE_DESKTOP": {
-        chrome.desktopCapture.chooseDesktopMedia(["screen", "window", "tab"], (streamId) => reply({ streamId: streamId || null }));
+        const base = msg.prefer === "screen" ? ["screen", "window", "tab"] : ["tab", "screen", "window"];
+        const sources = (msg.audio ? [...base, "audio"] : base) as any[];
+        chrome.desktopCapture.chooseDesktopMedia(sources, (streamId, options) => reply({ streamId: streamId || null, canAudio: !!options?.canRequestAudioTrack }));
         return;
       }
       case "CAPTURE_START": {
@@ -39,16 +42,21 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         return reply(r);
       }
       case "CAPTURE_STOP": case "CAPTURE_PAUSE": case "CAPTURE_RESUME": {
+        if (engineHost === "panel" && status.state !== "idle") {
+          const r = await chrome.runtime.sendMessage({ target: "panel", type: msg.type.replace("CAPTURE_", ""), reason: msg.reason }).catch(() => null);
+          if (r) return reply(r);
+          status = { state: "idle", sources: [], queued: 0, uploaded: 0, failed: 0, degraded: [] }; setIndicator(status); return reply({ ok: true });
+        }
         const ctx = await chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT] });
         if (!ctx.length) { status = { state: "idle", sources: [], queued: 0, uploaded: 0, failed: 0, degraded: [] }; setIndicator(status); return reply({ ok: true }); }
         const r = await chrome.runtime.sendMessage({ target: "offscreen", type: msg.type.replace("CAPTURE_", ""), reason: msg.reason });
         return reply(r);
       }
       case "OFFSCREEN_STATUS": {
-        status = msg.status as CaptureStatus; setIndicator(status);
+        status = msg.status as CaptureStatus; setIndicator(status); if (msg.host === "panel" || msg.host === "offscreen") engineHost = msg.host;
         await chrome.storage.session.set({ captureStatus: status }).catch(() => {});
         chrome.runtime.sendMessage({ type: "CAPTURE_STATUS", status }).catch(() => {}); // to side panel(s)
-        if (status.state === "idle") setTimeout(() => { if (status.state === "idle") closeOffscreen(); }, 1500);
+        if (status.state === "idle" && engineHost === "offscreen") setTimeout(() => { if (status.state === "idle") closeOffscreen(); }, 1500);
         return reply({ ok: true });
       }
       case "NOTIFY": {

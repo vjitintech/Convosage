@@ -17,8 +17,9 @@ export const config = {
   allowedOrigins: list("ALLOWED_ORIGINS"), // e.g. chrome-extension://abcdefghijklmnop ; empty = any extension origin
 
   // Model gateway (replaceable providers)
-  modelProvider: env("MODEL_PROVIDER", "anthropic") as "anthropic" | "openai",
-  modelBaseUrl: env("MODEL_BASE_URL", "https://api.anthropic.com"),
+  // "gemini" = Google's native Gemini API (works with the new AQ.… keys); "openai" = any OpenAI-compatible endpoint.
+  modelProvider: env("MODEL_PROVIDER", "anthropic") as "anthropic" | "openai" | "gemini",
+  modelBaseUrl: env("MODEL_BASE_URL") || (env("MODEL_PROVIDER") === "gemini" ? "https://generativelanguage.googleapis.com/v1beta" : "https://api.anthropic.com"),
   modelApiKey: env("MODEL_API_KEY"),
   modelName: env("MODEL_NAME", "claude-sonnet-5-5"),
   modelNameLarge: env("MODEL_NAME_LARGE") || env("MODEL_NAME", "claude-sonnet-5-5"),
@@ -26,6 +27,8 @@ export const config = {
   asrBaseUrl: env("ASR_BASE_URL", "https://api.openai.com/v1"),
   asrApiKey: env("ASR_API_KEY"),
   asrModel: env("ASR_MODEL", "whisper-1"),
+  // Optional: force the spoken language (ISO code, e.g. "en"). Empty = auto-detect any language.
+  asrLanguage: env("ASR_LANGUAGE", ""),
   aiDailyCallLimit: num("AI_DAILY_CALL_LIMIT", 2000), // per workspace
   mcpMaxToolCalls: num("MCP_MAX_TOOL_CALLS", 3),
 
@@ -46,7 +49,8 @@ export const config = {
   maxFrameBytes: num("MAX_FRAME_BYTES", 2_500_000),
   maxUploadTextChars: num("MAX_UPLOAD_TEXT_CHARS", 2_000_000),
   rateLimitPerMinute: num("RATE_LIMIT_PER_MINUTE", 240),
-  deletionGraceDays: num("DELETION_GRACE_DAYS", 7),
+  // 0 = deleting a session erases it immediately; >0 = keep it "Deletion pending" (restorable) for N days
+  deletionGraceDays: (() => { const g = Number(env("DELETION_GRACE_DAYS", "0")); return Number.isFinite(g) && g >= 0 ? Math.floor(g) : 0; })(),
   cronSecret: env("CRON_SECRET"),
   mcpSecretKey: env("MCP_SECRET_KEY"), // 32+ chars; encrypts MCP auth tokens at rest
 };

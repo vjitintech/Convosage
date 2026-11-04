@@ -8,12 +8,23 @@ export function Settings({ me, ws, onBack, onSignedOut, devOnly }: { me: Me | nu
   return <>
     {!devOnly && <div className="row"><button className="btn ghost sm" onClick={onBack}>← Back</button></div>}
     {me && <Account me={me} onSignedOut={onSignedOut} />}
+    {me && <AiCheck />}
     {me && ws && ["owner", "admin"].includes(ws.role) && <WorkspaceSettings ws={ws} />}
     {me && ws && ["owner", "admin"].includes(ws.role) && <McpServers ws={ws} />}
     {me && ws && ["owner", "admin"].includes(ws.role) && <AuditLog ws={ws} />}
     <DevEndpoints />
     <div className="small" style={{ textAlign: "center" }}>CONVOSAGE AI v{chrome.runtime.getManifest().version} · AI output can be wrong — check the evidence.</div>
   </>;
+}
+
+function AiCheck() {
+  const [busy, setBusy] = useState(false); const [res, setRes] = useState<{ ok: boolean; checks: Record<string, { ok: boolean; detail: string }> } | null>(null); const [err, setErr] = useState<string | null>(null);
+  const names: Record<string, string> = { text_model: "Questions & answers (text model)", large_model: "Wrap-up & knowledge (large model)", screen_reading: "Reading the screen (vision)", speech_to_text: "Speech-to-text" };
+  return <div className="card stack">
+    <div className="row"><h2 className="sp">AI setup</h2><button className="btn sm" disabled={busy} onClick={async () => { setBusy(true); setErr(null); setRes(null); try { setRes(await api("/v1/diagnostics")); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); } }}>{busy ? "Checking…" : "Check AI setup"}</button></div>
+    <ErrorNote error={err} />
+    {res && Object.entries(res.checks).map(([k, c]) => <div key={k} className={"notice " + (c.ok ? "" : "bad")}>{c.ok ? "✓" : "✗"} <b>{names[k] || k}</b> — {c.detail}</div>)}
+  </div>;
 }
 
 function Account({ me, onSignedOut }: { me: Me; onSignedOut: () => void }) {
@@ -34,7 +45,7 @@ function WorkspaceSettings({ ws }: { ws: Workspace }) {
     <h2>Workspace</h2>
     <div><label className="f" htmlFor="wn">Name</label><input id="wn" type="text" value={name} onChange={(e) => setName(e.target.value)} /></div>
     <div><label className="f" htmlFor="wr">Document retention (days)</label><input id="wr" type="number" min={1} max={3650} value={ret} onChange={(e) => setRet(Number(e.target.value))} /></div>
-    <div className="small">Raw audio and frames are never stored; only transcripts, extracted text and knowledge are kept. Deleted sessions are purged after the grace period unless under legal hold.</div>
+    <div className="small">Raw audio and frames are never stored; only transcripts, extracted text and knowledge are kept. Deleted sessions are erased immediately (unless under legal hold).</div>
     <button className="btn pri" onClick={async () => { setError(null); try { await api(`/v1/workspaces/${ws.id}`, { method: "PATCH", body: { name, retention_days: ret } }); toast("Workspace saved"); } catch (e) { setError((e as Error).message); } }}>Save</button>
     <ErrorNote error={error} />
   </div>;
