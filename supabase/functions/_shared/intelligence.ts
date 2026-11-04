@@ -41,6 +41,13 @@ export async function generateQuestions(sessionId: string, actorId: string | nul
   const existing = await db`select id, text, state from app.question_suggestions where session_id = ${sessionId} order by created_at`;
   const prior = await db`select artifact_type, content from app.knowledge_artifacts where programme_id = ${s.programme_id} and status = 'current'
                          and artifact_type in ('open_question','gap','contradiction') and (session_id is null or session_id <> ${sessionId}) order by created_at desc limit 15`;
+  // Reference material: documents attached to this session/programme, and Q&A already captured in earlier sessions.
+  const docs = await db`select id, title, left(coalesce(extracted_text,''), ${final ? 4000 : 1500}) as text from app.documents
+                        where workspace_id = ${s.workspace_id} and processing_state = 'ready' and (session_id = ${sessionId} or (session_id is null and programme_id = ${s.programme_id}) or programme_id = ${s.programme_id})
+                        order by (session_id = ${sessionId}) desc nulls last, created_at desc limit ${final ? 6 : 3}`;
+  const priorQa = await db`select q.text, q.answer_text, q.state, ss.title from app.question_suggestions q join app.sessions ss on ss.id = q.session_id
+                           where ss.programme_id = ${s.programme_id} and q.session_id <> ${sessionId} and q.state in ('answered','saved','suggested') and ss.status in ('active','disabled','archived')
+                           order by q.created_at desc limit 20`;
   let transcript = segs.slice().reverse().map((g) => `T${g.id} [${fmt(g.start_ms)}] ${g.speaker_label}: ${redact(g.text)}`).join("\n");
   if (final && transcript.length > 70000) transcript = segs.slice().reverse().map((g) => `T${g.id} [${fmt(g.start_ms)}] ${g.speaker_label}: ${redact(g.text).slice(0, 140)}`).join("\n").slice(-90000);
   const visual = vis.slice().reverse().map((v) => `V${v.id} [${fmt(v.timestamp_ms)}] ${v.type}${v.title ? ` "${redact(v.title)}"` : ""}: ${redact(String(v.extracted_text)).slice(0, 700)}`).join("\n");
@@ -53,6 +60,12 @@ ${contextForPrompt(ctx.content)}
 OPEN ITEMS FROM EARLIER SESSIONS (knowledge continuity):
 ${prior.map((p) => `- ${p.artifact_type}: ${redact(JSON.stringify(p.content)).slice(0, 300)}`).join("\n") || "(none)"}
 
+Q&A FROM EARLIER SESSIONS OF THIS PROGRAMME (do not repeat what is already answered; follow up where still open):
+${priorQa.map((q) => `- [${redact(String(q.title || ""))}] Q: ${redact(q.text)}${q.answer_text ? ` | A: ${redact(String(q.answer_text)).slice(0, 200)}` : ` | (${q.state === "answered" ? "answered" : "still open"})`}`).join("\n") || "(none)"}
+
+REFERENCE DOCUMENTS (uploaded by the user; may be in any language):
+${docs.map((d) => `D:${d.id} "${redact(d.title)}": ${redact(String(d.text)).replace(/\s+/g, " ")}`).join("\n") || "(none)"}
+
 <evidence>
 TRANSCRIPT (id [time] speaker: text):
 ${transcript || "(none)"}
@@ -63,6 +76,8 @@ ${visual || "(none)"}
 EXISTING QUESTIONS (never repeat or rephrase): ${JSON.stringify(existing.map((q) => ({ id: q.id, text: q.text, state: q.state })))}
 
 RULES
+- ALWAYS write questions, rationales and answers in clear ENGLISH, whatever language the evidence or documents are in.
+- Use the reference documents and earlier Q&A to spot gaps, contradictions with what is said or shown now, and items still open — but ground each question in this meeting's evidence ids where possible.
 - Up to ${final ? 6 : 3} new questions. Each must add value, fit the context profile, not be answered already in the evidence, be concise enough to ask aloud (<= 30 words).
 - Ground each question in evidence ids (T…/V…). If it is a general check with no direct evidence, use evidence [] and confidence <= 0.5.
 - If tools are available, you may look up approved reference material for a sharper question; list the tool in tool_refs. Never present tool content as something said in the meeting.

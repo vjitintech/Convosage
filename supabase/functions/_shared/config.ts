@@ -26,6 +26,8 @@ export const config = {
   asrBaseUrl: env("ASR_BASE_URL", "https://api.openai.com/v1"),
   asrApiKey: env("ASR_API_KEY"),
   asrModel: env("ASR_MODEL", "whisper-1"),
+  // Optional: force the spoken language (ISO code, e.g. "en"). Empty = auto-detect any language.
+  asrLanguage: env("ASR_LANGUAGE", ""),
   aiDailyCallLimit: num("AI_DAILY_CALL_LIMIT", 2000), // per workspace
   mcpMaxToolCalls: num("MCP_MAX_TOOL_CALLS", 3),
 

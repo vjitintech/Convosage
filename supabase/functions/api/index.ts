@@ -6,7 +6,7 @@ import { authenticate, type AuthUser } from "../_shared/auth.ts";
 import { background, bad, corsHeaders, errorResponse, forbidden, HttpError, json, oneOf, randomToken, rateLimit, readBytes, readJson, Router, sha256Hex, str, text, uuid } from "../_shared/http.ts";
 import { bootstrapUser, checkAiBudget, DEFAULT_CONTEXT, entitlement, requireEntitlement, requireProgramme, requireSession, requireWorkspace } from "../_shared/access.ts";
 import { cancelSubscription, completeMockPayment, createSubscription, providerFor } from "../_shared/billing.ts";
-import { connectMcp, encryptSecret, readFrame, transcribe } from "../_shared/model.ts";
+import { connectMcp, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
 import { ask, generateKnowledge, generateQuestions, inferContext, jaccard, latestContext } from "../_shared/intelligence.ts";
 import { redact } from "../_shared/redact.ts";
 
@@ -339,15 +339,22 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
     if (kind === "audio") {
       if (!asrConfigured()) throw new HttpError(503, "asr_unconfigured", "Speech-to-text is not configured on the server yet.");
       const bytes = await readBytes(req, config.maxAudioChunkBytes);
-      const segs = await transcribe(bytes, req.headers.get("content-type") || "audio/webm");
-      for (const g of segs) {
-        await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source)
-                   values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs + Math.round(g.start * 1000)}, ${startMs + Math.round(Math.max(g.end, g.start) * 1000)}, ${g.text.slice(0, 4000)}, ${source === "microphone" ? "You (microphone)" : "Unknown speaker"}, ${g.confidence}, ${source})`;
+      const asr = await transcribe(bytes, req.headers.get("content-type") || "audio/webm");
+      const english = isEnglish(asr.language) || asr.segments.every((g) => looksEnglish(g.text));
+      const texts = english ? asr.segments.map((g) => g.text) : await translateToEnglish(asr.segments.map((g) => g.text), s.workspace_id, u.id, asr.language);
+      for (let i = 0; i < asr.segments.length; i++) {
+        const g = asr.segments[i]; const text = texts[i].trim(); if (!text) continue;
+        await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source, language, original_text)
+                   values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs + Math.round(g.start * 1000)}, ${startMs + Math.round(Math.max(g.end, g.start) * 1000)}, ${text.slice(0, 4000)}, ${source === "microphone" ? "You (microphone)" : "Unknown speaker"}, ${g.confidence}, ${source},
+                           ${english ? "en" : asr.language || null}, ${english || text === g.text ? null : g.text.slice(0, 4000)})`;
         inserted++;
       }
     } else if (kind === "captions") {
-      const txt = new TextDecoder().decode(await readBytes(req, 20_000)).trim();
-      if (txt) { await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source) values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs}, ${endMs}, ${txt.slice(0, 4000)}, ${str(req.headers.get("x-speaker"), "speaker", 80, false) || "Unknown speaker"}, null, 'captions')`; inserted++; }
+      let txt = new TextDecoder().decode(await readBytes(req, 20_000)).trim();
+      const orig = txt; if (txt && !looksEnglish(txt)) txt = (await translateToEnglish([txt], s.workspace_id, u.id))[0].trim();
+      if (txt) { await db()`insert into app.transcript_segments (session_id, workspace_id, capture_id, seq, start_ms, end_ms, text, speaker_label, confidence, source) values (${s.id}, ${s.workspace_id}, ${c.id}, ${seq}, ${startMs}, ${endMs}, ${txt.slice(0, 4000)}, ${str(req.headers.get("x-speaker"), "speaker", 80, false) || "Unknown speaker"}, null, 'captions')`;
+        if (orig !== txt) await db()`update app.transcript_segments set original_text = ${orig.slice(0, 4000)}, language = 'auto' where id = (select max(id) from app.transcript_segments where session_id = ${s.id})`;
+        inserted++; }
     } else {
       if (!aiConfigured()) throw new HttpError(503, "ai_unconfigured", "AI is not configured on the server yet.");
       const bytes = await readBytes(req, config.maxFrameBytes);
@@ -355,7 +362,7 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
       const v = await readFrame(bytes, s.workspace_id, u.id);
       const last = await db()`select title, extracted_text from app.visual_evidence where session_id = ${s.id} order by timestamp_ms desc limit 1`;
       const transition = !last.length || jaccard(String(last[0].title || "") + " " + String(last[0].extracted_text || ""), v.title + " " + v.text) < 0.6;
-      if (v.text || v.title) { await db()`insert into app.visual_evidence (session_id, workspace_id, capture_id, timestamp_ms, extracted_text, type, title, is_transition, confidence) values (${s.id}, ${s.workspace_id}, ${c.id}, ${startMs}, ${v.text}, ${v.type}, ${v.title || null}, ${transition}, ${v.confidence})`; inserted++; }
+      if (v.text || v.title) { await db()`insert into app.visual_evidence (session_id, workspace_id, capture_id, timestamp_ms, extracted_text, type, title, is_transition, confidence, language) values (${s.id}, ${s.workspace_id}, ${c.id}, ${startMs}, ${v.text}, ${v.type}, ${v.title || null}, ${transition}, ${v.confidence}, ${v.language || null})`; inserted++; }
     }
     await db()`update app.jobs set state = 'done', updated_at = now() where id = ${job.id}`;
     await db()`update app.captures set last_sequence = greatest(last_sequence, ${seq}) where id = ${c.id}`;
@@ -380,10 +387,18 @@ r.add("POST", "/v1/sessions/:id/segments", async ({ req, params }) => {
   const source = b.source === "upload" ? "upload" : "manual";
   const segs = (Array.isArray(b.segments) ? b.segments : []).slice(0, 2000);
   let n = 0;
-  for (const g of segs) {
-    const t = String(g.text || "").trim(); if (!t) continue;
+  // Uploaded transcripts in any language are translated to English (original kept) in batches of 40 lines.
+  const rows = segs.map((g) => ({ g, t: String(g.text || "").trim() })).filter((x) => x.t);
+  const foreign = rows.filter((x) => !looksEnglish(x.t));
+  const translated = new Map<number, string>();
+  if (foreign.length && aiConfigured()) for (let i = 0; i < foreign.length && i < 800; i += 40) {
+    const batch = foreign.slice(i, i + 40); const out = await translateToEnglish(batch.map((x) => x.t), s.workspace_id, u.id);
+    batch.forEach((x, k) => translated.set(rows.indexOf(x), out[k]));
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const { g, t } = rows[i]; const en = (translated.get(i) ?? t).trim() || t;
     const st = Math.max(0, Math.round(Number(g.start_ms) || 0));
-    await db()`insert into app.transcript_segments (session_id, workspace_id, seq, start_ms, end_ms, text, speaker_label, source) values (${s.id}, ${s.workspace_id}, 0, ${st}, ${Math.max(st, Math.round(Number(g.end_ms) || st))}, ${t.slice(0, 4000)}, ${String(g.speaker_label || "Unknown speaker").slice(0, 80)}, ${source})`;
+    await db()`insert into app.transcript_segments (session_id, workspace_id, seq, start_ms, end_ms, text, speaker_label, source, language, original_text) values (${s.id}, ${s.workspace_id}, 0, ${st}, ${Math.max(st, Math.round(Number(g.end_ms) || st))}, ${en.slice(0, 4000)}, ${String(g.speaker_label || "Unknown speaker").slice(0, 80)}, ${source}, ${en !== t ? "auto" : null}, ${en !== t ? t.slice(0, 4000) : null})`;
     n++;
   }
   if (n) { await emit(s.id, s.workspace_id, "TranscriptAdded", { count: n, source }); await auditLog(s.workspace_id, u.id, "session", s.id, "transcript.imported", { segments: n, source }); if (await entitlement(u.id).then((e) => e.active)) await maybeQueueQuestions(s.id, s.workspace_id, u.id); }
@@ -408,7 +423,7 @@ r.add("GET", "/v1/sessions/:id/events", async ({ req, params, url }) => {
 r.add("GET", "/v1/sessions/:id/transcript", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id));
   const after = Number(url.searchParams.get("after_id") || 0);
-  const rows = await db()`select id, start_ms, end_ms, text, speaker_label, confidence, source, capture_id from app.transcript_segments where session_id = ${s.id} and id > ${after} order by start_ms, id limit 2000`;
+  const rows = await db()`select id, start_ms, end_ms, text, speaker_label, confidence, source, capture_id, language, original_text from app.transcript_segments where session_id = ${s.id} and id > ${after} order by start_ms, id limit 2000`;
   return json(req, { segments: rows });
 });
 r.add("GET", "/v1/sessions/:id/visual", async ({ req, params }) => {

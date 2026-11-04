@@ -122,7 +122,11 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
   useEffect(() => { const b = boxRef.current; if (b && b.scrollHeight - b.scrollTop - b.clientHeight < 80) b.scrollTop = b.scrollHeight; }, [segs.length]);
 
   const patchQ = async (q: Question, body: Record<string, unknown>) => { try { const r = await api<Question>(`/v1/questions/${q.id}`, { method: "PATCH", body }); setQs((a) => a.map((x) => (x.id === q.id ? { ...x, ...r } : x))); } catch (e) { setError((e as Error).message); } };
-  const shown = qs.filter((q) => filter === "all" || (filter === "open" ? ["suggested", "saved"].includes(q.state) : filter === "wrapup" ? q.phase === "final" && q.state !== "dismissed" : q.state === filter))
+  const inFilter = (q: Question, f: typeof filter) => f === "all" || (f === "open" ? ["suggested", "saved"].includes(q.state) : f === "wrapup" ? q.phase === "final" && q.state !== "dismissed" : q.state === f);
+  const counts = (["open", "wrapup", "answered", "dismissed", "all"] as const).map((f) => [f, qs.filter((q) => inFilter(q, f)).length] as const).filter(([f, n]) => n > 0 && !(f === "all" && n === qs.filter((q) => inFilter(q, "open")).length && qs.every((q) => inFilter(q, "open"))));
+  useEffect(() => { if (qs.length && !qs.some((q) => inFilter(q, filter))) setFilter(counts[0]?.[0] || "all"); }, [qs, filter]);
+  const visibleSegs = segs.filter((g) => g.confidence == null || g.confidence >= 0.35);
+  const shown = qs.filter((q) => inFilter(q, filter))
     .sort((a, b) => (b.state === "saved" ? 1 : 0) - (a.state === "saved" ? 1 : 0) || ({ critical: 4, high: 3, medium: 2, low: 1 }[b.priority] - { critical: 4, high: 3, medium: 2, low: 1 }[a.priority]) || +new Date(b.created_at) - +new Date(a.created_at));
   const active = s.status === "active";
   const otherCapture = cap.state !== "idle" && !capturingThis;
@@ -148,20 +152,19 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
         <input type="text" aria-label="Add a note or caption" placeholder="Add a note or paste live captions…" value={note} onChange={(e) => setNote(e.target.value)} /><button className="btn">Add</button></form>}
     </div>
 
-    <div className="card stack" aria-live="polite">
+    {(qs.length > 0 || (active && me.entitlement.active)) && <div className="card stack" aria-live="polite">
       <div className="row"><h3 className="sp">Questions</h3>
         {active && me.entitlement.active && <button className="btn sm" disabled={genBusy} onClick={async () => { setGenBusy(true); try { const r = await api(`/v1/sessions/${s.id}/questions/generate`, { method: "POST" }); toast(r.added ? "New questions added" : "Nothing new to ask right now"); loadQs(); } catch (e) { setError((e as Error).message); } finally { setGenBusy(false); } }}>{genBusy ? "Thinking…" : "Suggest now"}</button>}
         {active && me.entitlement.active && segs.length > 0 && <button className="btn sm" disabled={genBusy} onClick={async () => { setGenBusy(true); try { const r = await api(`/v1/sessions/${s.id}/questions/generate?final=1`, { method: "POST" }); toast(r.added ? "Wrap-up questions added" : "No further questions for the whole meeting"); setFilter("wrapup"); loadQs(); } catch (e) { setError((e as Error).message); } finally { setGenBusy(false); } }}>Wrap-up questions</button>}
         <button className="btn sm" onClick={() => copy(shown.map((q, i) => `${i + 1}. ${q.text}`).join("\n"), toast)} disabled={!shown.length}>Copy all</button></div>
-      <div className="row" role="radiogroup" aria-label="Filter questions">{(["open", "wrapup", "answered", "dismissed", "all"] as const).map((f) => <button key={f} role="radio" aria-checked={filter === f} className={"btn sm " + (filter === f ? "dark" : "")} onClick={() => setFilter(f)}>{{ open: "To ask", wrapup: "Wrap-up", answered: "Answered", dismissed: "Dismissed", all: "All" }[f]}</button>)}</div>
-      {!shown.length && <div className="empty">{filter === "open" ? (active ? "Questions appear here as the meeting is understood." : "No open questions.") : filter === "wrapup" ? "Wrap-up questions appear when you stop capture (or press “Wrap-up questions”). They review the whole meeting." : "None."}</div>}
+      {counts.length > 0 && <div className="row" role="radiogroup" aria-label="Filter questions">{counts.map(([f, n]) => <button key={f} role="radio" aria-checked={filter === f} className={"btn sm " + (filter === f ? "dark" : "")} onClick={() => setFilter(f)}>{{ open: "To ask", wrapup: "Wrap-up", answered: "Answered", dismissed: "Dismissed", all: "All" }[f]} · {n}</button>)}</div>}
       {shown.map((q) => <QuestionCard key={q.id} q={q} patch={(b) => patchQ(q, b)} />)}
-    </div>
+    </div>}
 
-    <div className="card stack">
-      <h3>Transcript</h3>
-      <div className="scroll" ref={boxRef}>{!segs.length ? <div className="empty">No transcript yet.</div> : segs.map((g) => <div key={g.id} className="seg"><div className="t">{fmtTime(g.start_ms)}<br />T{g.id}</div><div><b>{g.speaker_label}:</b> {g.text}{g.confidence != null && g.confidence < 0.5 && <span className="small"> (low confidence)</span>}</div></div>)}</div>
-    </div>
+    {visibleSegs.length > 0 && <details className="card stack">
+      <summary><b>Transcript</b> <span className="small">({visibleSegs.length} lines, in English)</span></summary>
+      <div className="scroll" ref={boxRef}>{visibleSegs.map((g) => <div key={g.id} className="seg"><div className="t">{fmtTime(g.start_ms)}<br />T{g.id}</div><div><b>{g.speaker_label}:</b> {g.text}{g.original_text && <span className="small" title={g.original_text}> (translated{g.language && g.language !== "auto" ? ` from ${g.language}` : ""})</span>}</div></div>)}</div>
+    </details>}
     {startOpen && <StartCapture s={s} onClose={() => setStartOpen(false)} onError={setError} />}
   </>;
 }

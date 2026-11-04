@@ -24,9 +24,10 @@ const { handler: webhook } = await import("../supabase/functions/razorpay-webhoo
 const { sql } = await import("../supabase/functions/_shared/db.ts");
 
 // Fresh schema
-const migration = await Deno.readTextFile(new URL("../supabase/migrations/20261103000001_core.sql", import.meta.url));
 await sql().unsafe("drop schema if exists app cascade");
-await sql().unsafe(migration);
+const migDir = new URL("../supabase/migrations/", import.meta.url);
+const migs = [...Deno.readDirSync(migDir)].map((e) => e.name).filter((n) => n.endsWith(".sql")).sort();
+for (const m of migs) await sql().unsafe(await Deno.readTextFile(new URL(m, migDir)));
 
 const secret = new TextEncoder().encode(Deno.env.get("SUPABASE_JWT_SECRET")!);
 async function token(sub: string, phone: string) {
@@ -242,3 +243,13 @@ Deno.test({ name: "audit trail is hash-chained and tamper-evident", sanitizeReso
   let threw = false; try { await sql()`delete from app.audit_events where id = ${rows[0].id}`; } catch { threw = true; } assert(threw);
   await sql().end();
 }});
+
+Deno.test("speech filter: Whisper silence phantoms are dropped; language detection for uploads", async () => {
+  const { isLikelyHallucination, looksEnglish, isEnglish } = await import("../supabase/functions/_shared/model.ts");
+  for (const t of ["Terima kasih.", "E aí", "Thank you for watching!", "Obrigado.", "you", "Subtitles by the Amara.org community"]) assert(isLikelyHallucination(t), t);
+  for (const t of ["The nightly batch restarts from the top.", "I'm going to go through the runbook now."]) assert(!isLikelyHallucination(t), t);
+  assert(looksEnglish("We will move the extract after the payment run is done"));
+  assert(!looksEnglish("A gente vai fazer uma coisa que eu vou fazer amanhã com o time"));
+  assert(!looksEnglish("आज हम भुगतान प्रक्रिया के बारे में बात करेंगे"));
+  assert(isEnglish("english") && isEnglish("en") && !isEnglish("portuguese"));
+});

@@ -66,15 +66,29 @@ async function pump() {
 }
 function enqueue(it: Omit<Item, "tries">) { queue.push({ ...it, tries: 0 }); push({}); pump(); }
 
+// Voice-activity gate: chunks with (almost) no sound are not sent. This saves speech-to-text quota and
+// stops Whisper from "hearing" phantom phrases in silence (e.g. "Thank you", "Terima kasih", "E aí").
+let vadCtx: AudioContext | null = null;
+function voiceMeter(stream: MediaStream) {
+  try {
+    vadCtx = vadCtx || new AudioContext();
+    const an = vadCtx.createAnalyser(); an.fftSize = 1024; vadCtx.createMediaStreamSource(stream).connect(an);
+    const buf = new Float32Array(an.fftSize); let voiced = 0;
+    const timer = setInterval(() => { an.getFloatTimeDomainData(buf); let sum = 0; for (const v of buf) sum += v * v; if (Math.sqrt(sum / buf.length) > 0.01) voiced++; }, 100);
+    return { take: () => { const v = voiced; voiced = 0; return v; }, stop: () => clearInterval(timer) };
+  } catch { return { take: () => 999, stop: () => {} }; }
+}
+
 function audioLoop(stream: MediaStream, source: string) {
   const slot = { rec: null as MediaRecorder | null, stopLoop: false, source }; recorders.push(slot);
+  const meter = voiceMeter(stream);
   const mime = ["audio/webm;codecs=opus", "audio/webm"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
   const one = () => {
     if (slot.stopLoop || paused || !stream.active) return;
     const rec = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : undefined); slot.rec = rec;
-    const parts: Blob[] = []; const start = now(); const mySeq = ++seq;
+    const parts: Blob[] = []; const start = now(); const mySeq = ++seq; meter.take();
     rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
-    rec.onstop = () => { const blob = new Blob(parts, { type: rec.mimeType || "audio/webm" }); if (blob.size > 2500) enqueue({ kind: "audio", source, seq: mySeq, startMs: start, endMs: now(), blob }); if (!slot.stopLoop && !paused) one(); };
+    rec.onstop = () => { const blob = new Blob(parts, { type: rec.mimeType || "audio/webm" }); const voiced = meter.take(); if (slot.stopLoop) meter.stop(); if (blob.size > 2500 && voiced >= 4) enqueue({ kind: "audio", source, seq: mySeq, startMs: start, endMs: now(), blob }); if (!slot.stopLoop && !paused) one(); };
     rec.start(); setTimeout(() => rec.state !== "inactive" && rec.stop(), CONFIG.AUDIO_CHUNK_SECONDS * 1000);
   };
   one();
