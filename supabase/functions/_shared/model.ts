@@ -20,7 +20,7 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       last = e;
       const st = (e as { status?: number }).status || 0;
       if (st && st < 500 && st !== 429) break;
-      await new Promise((r) => setTimeout(r, 400 * Math.pow(2, i) + Math.random() * 200));
+      await new Promise((r) => setTimeout(r, (st === 429 ? 5000 : 400) * Math.pow(2, i) + Math.random() * 200));
     }
   }
   throw last;
@@ -33,6 +33,19 @@ async function postJSON(url: string, headers: Record<string, string>, body: unkn
     if (!r.ok) { const e = new Error(`provider ${r.status}: ${JSON.stringify(j).slice(0, 300)}`) as Error & { status: number }; e.status = r.status; throw e; }
     return j;
   } finally { clearTimeout(t); }
+}
+
+/** Turns a raw provider failure into a clear, actionable message (instead of a generic 500). */
+export function aiError(e: unknown, what = "AI"): HttpError {
+  if (e instanceof HttpError) return e;
+  const st = (e as { status?: number }).status || 0; const raw = String((e as Error)?.message || e).slice(0, 260);
+  if (st === 401 || st === 403 || /api key|API_KEY_INVALID|PERMISSION_DENIED|unauthori/i.test(raw))
+    return new HttpError(502, "ai_key_rejected", `The ${what} provider rejected the API key (${raw}). Check MODEL_API_KEY in Supabase secrets — for Gemini use a key from aistudio.google.com that starts with "AIza".`);
+  if (st === 429 || /quota|rate.?limit|RESOURCE_EXHAUSTED/i.test(raw))
+    return new HttpError(429, "ai_rate_limited", `The ${what} provider's rate limit or free quota was reached (${raw}). It resumes automatically; for long meetings use a paid key or a lighter model.`);
+  if (st === 404 || (st >= 400 && st < 500 && /not found|does not exist|unknown model|is not supported/i.test(raw)))
+    return new HttpError(502, "ai_model_not_found", `The ${what} model name wasn't accepted (${raw}). Check MODEL_NAME / MODEL_NAME_LARGE / VISION_MODEL (e.g. gemini-2.5-flash).`);
+  return new HttpError(502, "ai_failed", `The ${what} provider returned an error (${raw}). Check MODEL_BASE_URL / MODEL_NAME / MODEL_API_KEY.`);
 }
 
 export function parseJSONLoose<T = unknown>(t: string): T {
@@ -155,7 +168,7 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
       }
     }
     throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
-  } finally {
+  } catch (e) { throw aiError(e); } finally {
     for (const t of tools) { try { await t.client.close(); } catch { /* ignore */ } }
   }
 }
@@ -250,6 +263,7 @@ export async function readFrame(jpeg: Uint8Array, workspaceId: string, actorId: 
   let b64 = ""; const CH = 0x8000; for (let i = 0; i < jpeg.length; i += CH) b64 += String.fromCharCode(...jpeg.subarray(i, i + CH)); b64 = btoa(b64);
   const ask = 'Extract the visible content of this shared-screen frame from a meeting. The screen may be in ANY language: write title and text in ENGLISH (translate if needed; keep code, names and numbers verbatim). Return ONLY JSON: {"type":"slide|table|diagram|code|screen","title":"slide title in English or empty","text":"all readable text in English; tables as Markdown; code verbatim; diagrams as a short description of boxes and arrows","language":"ISO code of the language shown on screen, e.g. en, hi, ja","confidence":0.0}. Ignore meeting-app chrome (toolbars, participant tiles, chat buttons). If nothing meaningful is visible, return type "screen" with empty text.';
   let out = "";
+  try {
   if (config.modelProvider === "anthropic") {
     const r = await withRetry(() => postJSON(config.modelBaseUrl.replace(/\/$/, "") + "/v1/messages", { "x-api-key": config.modelApiKey, "anthropic-version": "2023-06-01" },
       { model: config.visionModel, max_tokens: 2000, system: SYSTEM, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } }, { type: "text", text: ask }] }] }));
@@ -260,6 +274,7 @@ export async function readFrame(jpeg: Uint8Array, workspaceId: string, actorId: 
       { model: config.visionModel, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64," + b64 } }, { type: "text", text: ask }] }] }));
     out = ((r.choices as { message: { content: string } }[])?.[0]?.message?.content) || "";
   }
+  } catch (e) { throw aiError(e, "vision"); }
   await sql()`select app.audit(${workspaceId}, ${actorId}, 'ai', 'ocr', 'ai.call', ${sql().json({ purpose: "ocr", model: config.visionModel })})`;
   const j = parseJSONLoose<Partial<VisualRead>>(out);
   const types = ["slide", "table", "diagram", "code", "screen"];

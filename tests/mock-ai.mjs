@@ -5,9 +5,24 @@ const firstRef = (txt, letter) => { const m = txt.match(new RegExp("\\b" + lette
 http.createServer((req, res) => {
   const chunks = []; req.on("data", (c) => chunks.push(c)); req.on("end", () => {
     const raw = Buffer.concat(chunks);
-    const send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    let send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
     if (req.url.includes("/audio/transcriptions")) return send({ text: "The nightly claims batch restarts from the top when CLMV0200 abends.", duration: 10, segments: [{ start: 0.5, end: 4.2, text: "The nightly claims batch restarts from the top", avg_logprob: -0.1, no_speech_prob: 0.01 }, { start: 4.2, end: 9.8, text: "when CLMV0200 abends. Contact ops at ops@example.com.", avg_logprob: -0.2, no_speech_prob: 0.02 }] });
-    const body = JSON.parse(raw.toString() || "{}");
+    let body = JSON.parse(raw.toString() || "{}");
+    // OpenAI-compatible endpoint (as used with Gemini): adapt to the same scripted behaviour, reply in OpenAI shape.
+    if (req.url.includes("/chat/completions")) {
+      if ((req.headers.authorization || "") === "Bearer bad-key") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify([{ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } }])); }
+      const conv = (body.messages || []).filter((m) => m.role !== "system").map((m) => m.role === "tool" ? { role: "user", content: [{ type: "tool_result", content: m.content }] }
+        : { role: m.role, content: Array.isArray(m.content) ? m.content.map((c) => c.type === "image_url" ? { type: "image" } : c) : m.content });
+      const tools = (body.tools || []).map((t) => ({ name: t.function.name }));
+      const plain = send;
+      send = (o) => {
+        const tu = (o.content || []).filter((c) => c.type === "tool_use");
+        if (tu.length) return plain({ choices: [{ message: { role: "assistant", content: null, tool_calls: tu.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: JSON.stringify(t.input) } })) } }] });
+        const text = (o.content || []).map((c) => c.text || "").join("");
+        return plain({ choices: [{ message: { role: "assistant", content: "```json\n" + text + "\n```" } }] }); // Gemini often fences JSON
+      };
+      body = { ...body, messages: conv, tools };
+    }
     const msgs = body.messages || []; const first = msgs[0] || {};
     const firstText = typeof first.content === "string" ? first.content : (first.content || []).map((c) => c.text || "").join(" ");
     const hasImage = Array.isArray(first.content) && first.content.some((c) => c.type === "image");

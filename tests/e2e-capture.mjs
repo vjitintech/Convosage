@@ -65,19 +65,41 @@ await page.waitForSelector("text=■ Stop capture"); log("capture started");
 const srcs = await until(() => { const r = q(`select string_agg(distinct source, ',') from app.transcript_segments where session_id = '${sid}'`); return r || null; }, 45000, "transcript from tab audio");
 if (!srcs.includes("tab_audio") || srcs.includes("microphone")) throw new Error("expected tab audio only, got " + srcs);
 log("meeting tab audio transcribed (source: " + srcs + ")");
+const BAD = process.env.EXPECT_BAD_KEY === "1";
+if (BAD) {
+  // AI key rejected (e.g. wrong Gemini key): transcript still works, and the panel says exactly what is wrong.
+  await page.waitForSelector("text=Questions couldn't be generated", { timeout: 45000 });
+  await page.waitForSelector("text=rejected the API key"); log("bad AI key: panel explains the problem instead of 'Something went wrong'");
+  await shot(page, "b1-bad-key");
+  await page.getByRole("button", { name: /Settings/ }).click(); await page.getByRole("button", { name: "Check AI setup" }).click();
+  await page.waitForSelector("text=✗ Questions & answers"); await page.waitForSelector("text=✓ Speech-to-text");
+  log("Check AI setup pinpoints the failing part (text model ✗, speech-to-text ✓)"); await shot(page, "b2-ai-check");
+  await page.getByRole("button", { name: "← Back" }).click(); await page.getByText(title).first().click(); await page.waitForSelector("text=Disable session");
+  await page.getByRole("button", { name: "■ Stop capture" }).click();
+  await page.waitForSelector("text=● Start capture");
+} else {
 await until(() => Number(q(`select count(*) from app.visual_evidence where session_id = '${sid}'`)) > 0, 45000, "screen read from tab video");
 log("what is shown in the tab was read (visual evidence stored)");
 await page.waitForSelector("text=Hearing the meeting", { timeout: 20000 }); log("UI shows it is hearing the meeting");
 await page.waitForSelector("article.q", { timeout: 30000 }); log("live questions appeared while capturing");
 await page.waitForSelector("text=/To ask · \\d+/"); log("question groups shown with counts");
 if (await page.locator("text=Dismissed ·").count()) throw new Error("empty Dismissed group should be hidden");
+await page.waitForSelector("text=What was on screen"); await page.locator("summary", { hasText: "What was on screen" }).click();
+await page.waitForSelector("text=Claims batch recovery"); log("panel shows what was read from the screen");
+if (await page.locator("text=Something went wrong").count()) throw new Error("generic error shown");
 await shot(page, "c2-capturing");
-
 // Stop → wrap-up questions over the whole meeting
 await page.getByRole("button", { name: "■ Stop capture" }).click();
 await until(() => Number(q(`select count(*) from app.question_suggestions where session_id = '${sid}' and model_meta->>'phase' = 'final'`)) > 0, 30000, "wrap-up questions");
 await page.waitForSelector("text=/Wrap-up · \\d+/", { timeout: 20000 }); log("stopping capture added wrap-up questions for the whole meeting");
 await shot(page, "c3-wrapup");
+
+// Check AI setup (all green)
+await page.getByRole("button", { name: /Settings/ }).click(); await page.getByRole("button", { name: "Check AI setup" }).click();
+await page.waitForSelector("text=✓ Questions & answers"); await page.waitForSelector("text=✓ Reading the screen"); await page.waitForSelector("text=✓ Speech-to-text");
+if (await page.locator("text=✗").count()) throw new Error("AI check reported a failure"); log("Settings → Check AI setup: all green"); await shot(page, "c3b-ai-check");
+await page.getByRole("button", { name: "← Back" }).click(); await page.getByText(title).first().click(); await page.waitForSelector("text=Disable session");
+}
 
 // Delete permanently — immediately, no grace period
 await page.getByRole("button", { name: /^Delete/ }).first().click();

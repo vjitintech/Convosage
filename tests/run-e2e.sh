@@ -9,7 +9,7 @@ for f in supabase/migrations/*.sql; do psql "$DB" -q -v ON_ERROR_STOP=1 -f "$f" 
 node tests/mock-ai.mjs >/tmp/mock-ai.log 2>&1 & A=$!
 node tests/mcp-http-server.mjs >/tmp/mcp.log 2>&1 & M=$!
 node tests/mock-gotrue.mjs >/tmp/gotrue.log 2>&1 & G=$!
-bash tests/run-api-local.sh >/tmp/api.log 2>&1 & P=$!
+bash tests/run-api-local.sh >/tmp/api.log 2>&1 & P=$!   # set AI_MODE=openai to mimic Gemini, KEY=bad-key + EXPECT_BAD_KEY=1 for a rejected key
 trap 'kill $A $M $G $P 2>/dev/null || true' EXIT
 for i in $(seq 1 60); do curl -s http://127.0.0.1:8000/v1/health >/dev/null 2>&1 && break; sleep 1; done
 RUN="node"; [ -z "${DISPLAY:-}" ] && RUN="xvfb-run -a -s '-screen 0 1280x1024x24' node"

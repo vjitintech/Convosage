@@ -6,7 +6,7 @@ import { authenticate, type AuthUser } from "../_shared/auth.ts";
 import { background, bad, corsHeaders, errorResponse, forbidden, HttpError, json, oneOf, randomToken, rateLimit, readBytes, readJson, Router, sha256Hex, str, text, uuid } from "../_shared/http.ts";
 import { bootstrapUser, checkAiBudget, DEFAULT_CONTEXT, entitlement, requireEntitlement, requireProgramme, requireSession, requireWorkspace } from "../_shared/access.ts";
 import { cancelSubscription, completeMockPayment, createSubscription, providerFor } from "../_shared/billing.ts";
-import { connectMcp, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
+import { aiError, chat, connectMcp, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
 import { ask, generateKnowledge, generateQuestions, inferContext, jaccard, latestContext } from "../_shared/intelligence.ts";
 import { redact } from "../_shared/redact.ts";
 
@@ -30,6 +30,36 @@ function sessionView(s: Record<string, unknown>) {
 r.add("GET", "/v1/health", async ({ req }) => {
   let dbOk = false; try { await db()`select 1`; dbOk = true; } catch { /* ignore */ }
   return json(req, { ok: dbOk, ai: aiConfigured(), asr: asrConfigured(), billing: config.billingProvider, version: "2.0.0" });
+});
+
+// Self-check of the AI setup (text model, screen reading, speech-to-text) — used by Settings → "Check AI setup".
+r.add("GET", "/v1/diagnostics", async ({ req }) => {
+  const u = await me(req);
+  const [m] = await db()`select workspace_id from app.memberships where user_id = ${u.id} limit 1`;
+  const ws = m?.workspace_id as string;
+  const out: Record<string, { ok: boolean; detail: string }> = {};
+  const t0 = Date.now();
+  try { const r = await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", maxTokens: 50 }); out.text_model = { ok: /ok/.test(r.text), detail: `${config.modelName} answered in ${Date.now() - t0} ms` }; }
+  catch (e) { out.text_model = { ok: false, detail: aiError(e).message }; }
+  if (config.modelNameLarge !== config.modelName) {
+    try { await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", large: true, maxTokens: 50 }); out.large_model = { ok: true, detail: `${config.modelNameLarge} OK` }; }
+    catch (e) { out.large_model = { ok: false, detail: aiError(e).message }; }
+  }
+  try {
+    // 64×32 white JPEG — checks that the vision model accepts images.
+    const jpg = Uint8Array.from(atob("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgUFBcUFxsbGxsbGyAeICEhISAgICAhISEkJCQqKiokJCQhISQkKCgqKi4vLisrKisvLzIyMjw8OTlGRkhWVmf/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIACAAQAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AAAAAAAAAAAAAAAD/2Q=="), (c) => c.charCodeAt(0));
+    await readFrame(jpg, ws, u.id); out.screen_reading = { ok: true, detail: `${config.visionModel} accepted an image` };
+  } catch (e) { out.screen_reading = { ok: false, detail: aiError(e, "vision").message }; }
+  if (!asrConfigured()) out.speech_to_text = { ok: false, detail: "ASR_BASE_URL / ASR_API_KEY are not set." };
+  else {
+    try {
+      // 1 s of silence as WAV — a working speech-to-text returns an (empty) result.
+      const n = 16000, b = new ArrayBuffer(44 + n * 2), d = new DataView(b), w = (o: number, s: string) => [...s].forEach((c, i) => d.setUint8(o + i, c.charCodeAt(0)));
+      w(0, "RIFF"); d.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt "); d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true); d.setUint32(24, 16000, true); d.setUint32(28, 32000, true); d.setUint16(32, 2, true); d.setUint16(34, 16, true); w(36, "data"); d.setUint32(40, n * 2, true);
+      await transcribe(new Uint8Array(b), "audio/wav"); out.speech_to_text = { ok: true, detail: `${config.asrModel} OK` };
+    } catch (e) { out.speech_to_text = { ok: false, detail: String((e as Error).message).slice(0, 300) + " — check ASR_BASE_URL / ASR_API_KEY / ASR_MODEL." }; }
+  }
+  return json(req, { checks: out, ok: Object.values(out).every((c) => c.ok) });
 });
 
 r.add("GET", "/v1/me", async ({ req }) => {
@@ -438,7 +468,10 @@ r.add("GET", "/v1/sessions/:id/questions", async ({ req, params }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id));
   const rows = await db()`select id, text, rationale, category, priority, confidence, evidence_refs, tool_refs, state, answer_text, answer_refs, answer_confirmed, feedback, created_at, updated_at, coalesce(model_meta->>'phase','live') as phase
                           from app.question_suggestions where session_id = ${s.id} order by created_at desc limit 500`;
-  return json(req, { questions: rows });
+  // If the most recent question run failed (e.g. AI key/quota problem), say why instead of showing nothing.
+  const [last] = await db()`select state, last_error, updated_at from app.jobs where session_id = ${s.id} and kind = 'questions' and state <> 'queued' and state <> 'running' order by updated_at desc limit 1`;
+  const problem = last && (last.state === "failed" || last.state === "dead") && Date.now() - new Date(last.updated_at).getTime() < 15 * 60_000 ? String(last.last_error || "Question generation failed.") : null;
+  return json(req, { questions: rows, problem });
 });
 r.add("POST", "/v1/sessions/:id/questions/generate", async ({ req, params, url }) => {
   const u = await me(req); const s = await requireSession(u.id, uuid(params.id), "owner_or_admin");

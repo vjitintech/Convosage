@@ -116,9 +116,12 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
   const [startOpen, setStartOpen] = useState(false); const [note, setNote] = useState(""); const [genBusy, setGenBusy] = useState(false);
   const lastId = useRef(0); const toast = useToast(); const boxRef = useRef<HTMLDivElement>(null);
   const loadSegs = async (reset = false) => { if (reset) lastId.current = 0; const r = await api(`/v1/sessions/${s.id}/transcript?after_id=${lastId.current}`); if (r.segments.length) { lastId.current = r.segments[r.segments.length - 1].id; setSegs((old) => { const base = reset ? [] : old; const seen = new Set(base.map((x) => x.id)); return [...base, ...r.segments.filter((x: Segment) => !seen.has(x.id))].sort((a, b) => a.start_ms - b.start_ms || a.id - b.id); }); } else if (reset) setSegs([]); };
-  const loadQs = async () => { const r = await api(`/v1/sessions/${s.id}/questions`); setQs(r.questions); };
-  useEffect(() => { loadSegs(true).catch(() => {}); loadQs().catch(() => {}); }, [s.id]);
-  useEffect(() => { if (tick) { loadSegs().catch(() => {}); loadQs().catch(() => {}); } }, [tick]);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [screens, setScreens] = useState<{ id: number; timestamp_ms: number; type: string; title: string | null; extracted_text: string }[]>([]);
+  const loadQs = async () => { const r = await api(`/v1/sessions/${s.id}/questions`); setQs(r.questions); setProblem(r.problem || null); };
+  const loadScreens = async () => { const r = await api(`/v1/sessions/${s.id}/visual`); setScreens(r.evidence || []); };
+  useEffect(() => { loadSegs(true).catch(() => {}); loadQs().catch(() => {}); loadScreens().catch(() => {}); }, [s.id]);
+  useEffect(() => { if (tick) { loadSegs().catch(() => {}); loadQs().catch(() => {}); loadScreens().catch(() => {}); } }, [tick]);
   useEffect(() => { const b = boxRef.current; if (b && b.scrollHeight - b.scrollTop - b.clientHeight < 80) b.scrollTop = b.scrollHeight; }, [segs.length]);
 
   const patchQ = async (q: Question, body: Record<string, unknown>) => { try { const r = await api<Question>(`/v1/questions/${q.id}`, { method: "PATCH", body }); setQs((a) => a.map((x) => (x.id === q.id ? { ...x, ...r } : x))); } catch (e) { setError((e as Error).message); } };
@@ -164,8 +167,14 @@ function Live({ me, s, tick, cap, capturingThis, onEntitlementChange, setError }
         {active && me.entitlement.active && segs.length > 0 && <button className="btn sm" disabled={genBusy} onClick={async () => { setGenBusy(true); try { const r = await api(`/v1/sessions/${s.id}/questions/generate?final=1`, { method: "POST" }); toast(r.added ? "Wrap-up questions added" : "No further questions for the whole meeting"); setFilter("wrapup"); loadQs(); } catch (e) { setError((e as Error).message); } finally { setGenBusy(false); } }}>Wrap-up questions</button>}
         <button className="btn sm" onClick={() => copy(shown.map((q, i) => `${i + 1}. ${q.text}`).join("\n"), toast)} disabled={!shown.length}>Copy all</button></div>
       {counts.length > 0 && <div className="row" role="radiogroup" aria-label="Filter questions">{counts.map(([f, n]) => <button key={f} role="radio" aria-checked={filter === f} className={"btn sm " + (filter === f ? "dark" : "")} onClick={() => setFilter(f)}>{{ open: "To ask", wrapup: "Wrap-up", answered: "Answered", dismissed: "Dismissed", all: "All" }[f]} · {n}</button>)}</div>}
+      {problem && <div className="notice bad" role="alert">Questions couldn't be generated: {problem} <span className="small">(Settings → Check AI setup)</span></div>}
       {shown.map((q) => <QuestionCard key={q.id} q={q} patch={(b) => patchQ(q, b)} />)}
     </div>}
+
+    {screens.length > 0 && <details className="card stack">
+      <summary><b>What was on screen</b> <span className="small">({screens.length} read, in English)</span></summary>
+      <div className="scroll">{screens.map((v) => <div key={v.id} className="seg"><div className="t">{fmtTime(v.timestamp_ms)}<br />V{v.id}</div><div><b>{v.title || v.type}</b><div className="small" style={{ whiteSpace: "pre-wrap" }}>{v.extracted_text.slice(0, 400)}{v.extracted_text.length > 400 ? "…" : ""}</div></div></div>)}</div>
+    </details>}
 
     {visibleSegs.length > 0 && <details className="card stack">
       <summary><b>Transcript</b> <span className="small">({visibleSegs.length} lines, in English)</span></summary>
