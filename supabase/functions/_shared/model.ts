@@ -178,7 +178,7 @@ export async function transcribe(audio: Uint8Array, mime: string, language?: str
   const r = await withRetry(async () => {
     const res = await fetch(config.asrBaseUrl.replace(/\/$/, "") + "/audio/transcriptions", { method: "POST", headers, body: fd });
     const t = await res.text(); let j: Record<string, unknown> = {}; try { j = JSON.parse(t); } catch { j = { text: t }; }
-    if (!res.ok) { const e = new Error("asr " + res.status) as Error & { status: number }; e.status = res.status; throw e; }
+    if (!res.ok) { const e = new Error(`provider ${res.status}: ${String((j as any)?.error?.message || (j as any)?.error || t).slice(0, 200)}`) as Error & { status: number }; e.status = res.status; throw e; }
     return j;
   });
   const segs = (r.segments as { start: number; end: number; text: string; avg_logprob?: number; no_speech_prob?: number }[] | undefined) || [];

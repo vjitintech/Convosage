@@ -50,7 +50,12 @@ async function pump() {
         if (code === "capture_token_expired") { await refreshCaptureToken(); continue; }
         if (["session_not_active", "capture_stopped", "subscription_required"].includes(code)) { await stop("server_" + code, false); break; }
         if (r.status === 413 || r.status === 400) { queue.shift(); push({ failed: st.failed + 1, lastError: j?.error?.message }); continue; }
-        throw new Error(j?.error?.message || "upload failed " + r.status);
+        it.tries++;
+        const why = j?.error?.message || `Server error ${r.status}`;
+        if (it.tries >= 3) { queue.shift(); push({ failed: st.failed + 1, lastError: why + " — this chunk was skipped." }); continue; }
+        push({ lastError: why + " (retrying)" });
+        await new Promise((res) => setTimeout(res, 2000 * it.tries));
+        continue;
       } catch (e) {
         it.tries++; push({ lastError: "Connection problem — buffering and retrying (" + queue.length + " waiting)" });
         if (queue.length > 90) { queue.splice(0, queue.length - 90); push({ degraded: [...new Set([...st.degraded, "Oldest buffered media dropped after a long outage"])] }); }

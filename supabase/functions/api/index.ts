@@ -339,7 +339,10 @@ r.add("POST", "/v1/sessions/:id/media", async ({ req, params }) => {
   } catch (e) {
     await db()`update app.jobs set state = 'failed', last_error = ${String((e as Error).message).slice(0, 300)}, updated_at = now() where id = ${job.id}`;
     try { await emit(s.id, s.workspace_id, "MediaFailed", { capture_id: c.id, seq, kind, error: (e as HttpError).code || "processing_failed" }); } catch { /* session may have been disabled */ }
-    throw e;
+    if (e instanceof HttpError) throw e;
+    const raw = String((e as Error).message || "").slice(0, 240);
+    if (kind === "audio") throw new HttpError(502, "asr_failed", "Speech-to-text failed (" + raw + "). Check ASR_BASE_URL / ASR_API_KEY / ASR_MODEL and the provider's credit.");
+    throw new HttpError(502, "vision_failed", "Reading the screen failed (" + raw + "). Check MODEL_* / VISION_MODEL settings.");
   }
   if (inserted) await maybeQueueQuestions(s.id, s.workspace_id, u.id);
   return json(req, { ok: true, inserted });
