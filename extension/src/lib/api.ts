@@ -13,7 +13,10 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
     signal: opts.signal,
   });
   let res: Response;
-  try { res = await go(await accessToken()); } catch (err) { if ((err as Error).name === "AbortError") throw err; throw new ApiError(0, "network", "Can't reach the CONVOSAGE service. Check your connection."); }
+  const timeout = new AbortController(); const tt = setTimeout(() => timeout.abort(), 30000);
+  if (!opts.signal) opts = { ...opts, signal: timeout.signal };
+  try { res = await go(await accessToken()); } catch (err) { if (timeout.signal.aborted) throw new ApiError(0, "timeout", "The CONVOSAGE server didn't respond in 30 seconds. Check that the Supabase functions are deployed and healthy."); if ((err as Error).name === "AbortError") throw err; throw new ApiError(0, "network", "Can't reach the CONVOSAGE service. Check your connection."); }
+  clearTimeout(tt);
   if (res.status === 401) { const t = await forceRefresh(); if (t) res = await go(t); }
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));

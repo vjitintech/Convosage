@@ -13,12 +13,17 @@ import { Settings } from "./Settings";
 type View = { name: "home" } | { name: "session"; session: SessionRow; programme: Programme } | { name: "settings" };
 
 export function App() {
-  const [phase, setPhase] = useState<"loading" | "unconfigured" | "signin" | "ready">("loading");
+  const [phase, setPhase] = useState<"loading" | "unconfigured" | "signin" | "ready" | "error">("loading");
   const [me, setMe] = useState<Me | null>(null); const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>({ name: "home" }); const [wsId, setWsId] = useState<string>("");
   const loadMe = useCallback(async () => {
     try { const m = await api<Me>("/v1/me"); setMe(m); setWsId((w) => (m.workspaces.some((x) => x.id === w) ? w : m.workspaces[0]?.id || "")); setPhase("ready"); setError(null); }
-    catch (e) { const st = (e as { status?: number }).status; if (st === 401) { setPhase("signin"); } else setError((e as Error).message); }
+    catch (e) {
+      const st = (e as { status?: number }).status; if (st === 401) { setPhase("signin"); return; }
+      const msg = (e as Error).message;
+      setError(st === 404 ? "The CONVOSAGE server isn't deployed yet (Supabase Edge Function \"api\" not found). Deploy it, then press Retry." : msg);
+      setPhase("error");
+    }
   }, []);
   useEffect(() => { (async () => {
     if (!isConfigured(await endpoints())) return setPhase("unconfigured");
@@ -36,6 +41,9 @@ export function App() {
       </>}
     </header>
     {phase === "loading" && <div className="main"><Loading /></div>}
+    {phase === "error" && <div className="main"><ErrorNote error={error} /><div className="row">
+      <button className="btn pri" onClick={() => { setPhase("loading"); loadMe(); }}>Retry</button>
+      <button className="btn" onClick={async () => { await signOut(); setError(null); setPhase("signin"); }}>Sign out</button></div></div>}
     {phase === "unconfigured" && <div className="main"><div className="notice warn">This build isn't connected to a CONVOSAGE backend yet. Set SUPABASE_URL and the publishable key in <span className="mono">src/config.ts</span> and rebuild, or set developer endpoints below.</div><Settings me={null} ws={undefined} onBack={() => location.reload()} onSignedOut={() => location.reload()} devOnly /></div>}
     {phase === "signin" && <Login onSignedIn={() => { setPhase("loading"); loadMe(); }} />}
     {phase === "ready" && me && <div className="main">
