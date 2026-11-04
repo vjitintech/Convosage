@@ -20,7 +20,7 @@ sms_sent = 30            # per hour, project-wide; raise after launch
 token_verifications = 30 # per 5 minutes per IP
 
 [auth.sms]
-enable_signup = true
+enabled = true
 enable_confirmations = false
 max_frequency = "60s"
 template = "Your CONVOSAGE AI code is {{ .Code }}"
