@@ -6,7 +6,7 @@ import { Confirm, ErrorNote, Loading, useAsync, useToast } from "./common";
 
 export function Settings({ me, ws, onBack, onSignedOut, devOnly }: { me: Me | null; ws?: Workspace; onBack: () => void; onSignedOut: () => void; devOnly?: boolean }) {
   return <>
-    {!devOnly && <div className="row"><button className="btn ghost sm" onClick={onBack}>← Back</button></div>}
+    {!devOnly && <div className="row"><button className="btn back" onClick={onBack}>← Back</button></div>}
     {me && <Account me={me} onSignedOut={onSignedOut} />}
     {me && <AiCheck />}
     {me && ws && ["owner", "admin"].includes(ws.role) && <WorkspaceSettings ws={ws} />}

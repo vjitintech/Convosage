@@ -64,7 +64,7 @@ export function SessionView({ me, ws, initial, programme, onBack, onEntitlementC
   const canManage = s.can_manage !== false;
   return <>
     <div className="card stack">
-      <div className="row"><button className="btn ghost sm" onClick={onBack}>← Sessions</button><span className="sp" /><StatusBadge status={s.status} /></div>
+      <div className="row"><button className="btn back" onClick={onBack}>← Back to sessions</button><span className="sp" /><StatusBadge status={s.status} /></div>
       <div className="row"><h2 className="sp">{s.title}</h2>{canManage && s.status !== "archived" && s.status !== "deletion_pending" && <button className="btn ghost sm" onClick={() => setRename(true)}>Rename</button>}</div>
       <div className="small">{programme.title} · {s.platform || "Meeting"}</div>
       {canManage && <div className="row">

@@ -50,3 +50,12 @@ textarea{resize:vertical;min-height:64px}
 .kv{display:grid;grid-template-columns:110px 1fr;gap:4px 8px;font-size:13px}
 .prov{font-size:11px;font-weight:700;border-radius:4px;padding:1px 5px;margin-left:4px}.prov.user{background:var(--blue-l);color:var(--blue)}.prov.ai{background:var(--amber-l);color:var(--amber)}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+/* Back buttons are always visible as buttons */
+.btn.back{background:#fff;border:1.5px solid var(--sage);color:var(--sage-d);font-weight:700;padding:4px 12px}.btn.back:hover{background:var(--sage-l)}
+/* Info tip */
+.info-wrap{position:relative;display:inline-flex}
+.info{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--blue);background:#fff;color:var(--blue);font:italic 700 11px/1 Georgia,serif;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}
+.info:hover,.info[aria-expanded=true]{background:var(--blue);color:#fff}
+.info-pop{position:fixed;top:64px;left:12px;right:12px;z-index:60;max-width:440px;margin:0 auto;text-transform:none;letter-spacing:normal;background:#fff;border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:9px;padding:10px 12px;box-shadow:0 8px 24px rgba(0,0,0,.18);font-size:12.5px;font-weight:400;line-height:1.45;color:var(--ink)}
+.explain{font-size:12px;color:var(--muted);background:var(--blue-l);border-radius:8px;padding:7px 9px;line-height:1.45}

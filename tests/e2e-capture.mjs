@@ -9,6 +9,17 @@ const FIX = new URL("./fixtures/", import.meta.url).pathname;
 const DB = process.env.TEST_DB_URL || "postgres://postgres:postgres@localhost:5432/convosage";
 const q = (sql) => execFileSync("psql", [DB, "-At", "-c", sql]).toString().trim();
 const log = (...a) => console.log("✔", ...a);
+async function newProgrammeAndSession(page, progTitle) {
+  await page.getByRole("button", { name: "+ New programme" }).click();
+  await page.getByLabel("Title", { exact: true }).fill(progTitle);
+  await page.getByRole("button", { name: /Next: context profile/ }).click();
+  await page.waitForSelector("text=Step 2 of 2");
+  await page.locator(".modal button", { hasText: "+ Add" }).nth(1).click();
+  await page.getByLabel("Domain item").first().fill("US healthcare claims; finance; strategy");
+  await page.getByRole("button", { name: "Save new version" }).click(); await page.waitForSelector("text=saved as version");
+  await page.locator(".modal .btn.back").click();
+  await page.getByRole("button", { name: "Create session" }).click();
+}
 fs.mkdirSync("/tmp/shots", { recursive: true });
 const shot = (p, n) => p.screenshot({ path: `/tmp/shots/${n}.png`, fullPage: true });
 const until = async (fn, ms, what) => { const end = Date.now() + ms; while (Date.now() < end) { const v = await fn(); if (v) return v; await new Promise((r) => setTimeout(r, 1000)); } throw new Error("timed out: " + what); };
@@ -45,9 +56,9 @@ if (await page.getByRole("button", { name: /Subscribe/ }).count()) {
 await page.waitForSelector(".top >> text=Pro", { timeout: 15000 }); log("signed in with dummy user 1, subscription active");
 
 const title = "MCP explained — capture test " + Date.now();
-await page.getByLabel("Meaningful title").fill(title); await page.getByRole("button", { name: "Create" }).click();
+await newProgrammeAndSession(page, title);
 await page.waitForSelector("text=Disable session");
-const sid = q(`select id from app.sessions where title = '${title}'`); log("session created", sid);
+const sid = q(`select id from app.sessions where title like '${title}%' order by created_at desc limit 1`); log("session created", sid);
 
 // Start capture: choose the meeting tab, hear + see, no microphone
 await page.getByRole("button", { name: "● Start capture" }).click();
@@ -74,7 +85,7 @@ if (BAD) {
   await page.getByRole("button", { name: /Settings/ }).click(); await page.getByRole("button", { name: "Check AI setup" }).click();
   await page.waitForSelector("text=✗ Questions & answers"); await page.waitForSelector("text=✓ Speech-to-text");
   log("Check AI setup pinpoints the failing part (text model ✗, speech-to-text ✓)"); await shot(page, "b2-ai-check");
-  await page.getByRole("button", { name: "← Back" }).click(); await page.getByText(title).first().click(); await page.waitForSelector("text=Disable session");
+  await page.getByRole("button", { name: "← Back" }).click(); await page.locator("button.item", { hasText: title }).first().click(); await page.waitForSelector("text=Disable session");
   await page.getByRole("button", { name: "■ Stop capture" }).click();
   await page.waitForSelector("text=● Start capture");
 } else {
@@ -98,7 +109,7 @@ await shot(page, "c3-wrapup");
 await page.getByRole("button", { name: /Settings/ }).click(); await page.getByRole("button", { name: "Check AI setup" }).click();
 await page.waitForSelector("text=✓ Questions & answers"); await page.waitForSelector("text=✓ Reading the screen"); await page.waitForSelector("text=✓ Speech-to-text");
 if (await page.locator("text=✗").count()) throw new Error("AI check reported a failure"); log("Settings → Check AI setup: all green"); await shot(page, "c3b-ai-check");
-await page.getByRole("button", { name: "← Back" }).click(); await page.getByText(title).first().click(); await page.waitForSelector("text=Disable session");
+await page.getByRole("button", { name: "← Back" }).click(); await page.locator("button.item", { hasText: title }).first().click(); await page.waitForSelector("text=Disable session");
 }
 
 // Delete permanently — immediately, no grace period

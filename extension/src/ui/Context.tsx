@@ -7,7 +7,7 @@ type Item = { text: string; source: "user" | "ai" };
 const FIELDS: [string, string][] = [["objectives", "Objectives"], ["domain", "Domain"], ["technology", "Technology"], ["audience", "Audience"], ["terminology", "Terminology"], ["constraints", "Constraints"], ["success_criteria", "Success criteria"], ["known_facts", "Known facts"], ["unknowns", "Unknowns"], ["entities", "Key entities"]];
 
 // Editable profile; shows user-provided vs AI-inferred facts; every save is a new version.
-export function ContextEditor({ programme }: { programme: Programme }) {
+export function ContextEditor({ programme, onSaved }: { programme: Programme; onSaved?: (version: number) => void }) {
   const [content, setContent] = useState<Record<string, Item[]> | null>(null); const [version, setVersion] = useState(0);
   const [material, setMaterial] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [dirty, setDirty] = useState(false);
   const toast = useToast();
@@ -25,7 +25,7 @@ export function ContextEditor({ programme }: { programme: Programme }) {
         <button className="btn ghost sm" aria-label={"Remove " + it.text} onClick={() => setField(k, content[k].filter((_, j) => j !== i))}>✕</button></div>)}
       <button className="btn ghost sm" onClick={() => setField(k, [...(content[k] || []), { text: "", source: "user" }])}>+ Add</button>
     </div>)}
-    <div className="row"><button className="btn pri" disabled={!dirty || busy} onClick={async () => { setBusy(true); setError(null); try { const r = await api(`/v1/programmes/${programme.id}/context`, { method: "PUT", body: { content, base_version: version } }); setVersion(r.version); setDirty(false); toast("Context saved as version " + r.version); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }}>Save new version</button></div>
+    <div className="row"><button className="btn pri" disabled={!dirty || busy} onClick={async () => { setBusy(true); setError(null); try { const r = await api(`/v1/programmes/${programme.id}/context`, { method: "PUT", body: { content, base_version: version } }); setVersion(r.version); setDirty(false); onSaved?.(r.version); toast("Context saved as version " + r.version); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } }}>Save new version</button></div>
     <details><summary className="small">Let AI draft the profile from an agenda, brief or notes</summary>
       <div className="stack" style={{ marginTop: 6 }}>
         <textarea value={material} onChange={(e) => setMaterial(e.target.value)} placeholder="Paste the agenda, programme brief or glossary…" rows={5} />

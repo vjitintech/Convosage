@@ -5,6 +5,17 @@ import fs from "node:fs";
 const EXT = new URL("../extension/dist", import.meta.url).pathname;
 const shot = (p, n) => p.screenshot({ path: `/tmp/shots/${n}.png`, fullPage: true });
 const log = (...a) => console.log("✔", ...a);
+async function newProgrammeAndSession(page, progTitle) {
+  await page.getByRole("button", { name: "+ New programme" }).click();
+  await page.getByLabel("Title", { exact: true }).fill(progTitle);
+  await page.getByRole("button", { name: /Next: context profile/ }).click();
+  await page.waitForSelector("text=Step 2 of 2");
+  await page.locator(".modal button", { hasText: "+ Add" }).nth(1).click();
+  await page.getByLabel("Domain item").first().fill("US healthcare claims; finance; strategy");
+  await page.getByRole("button", { name: "Save new version" }).click(); await page.waitForSelector("text=saved as version");
+  await page.locator(".modal .btn.back").click();
+  await page.getByRole("button", { name: "Create session" }).click();
+}
 const ctx = await chromium.launchPersistentContext("/tmp/pw-ext-" + Date.now(), { headless: false, viewport: { width: 420, height: 900 },
   args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`] });
 let [sw] = ctx.serviceWorkers(); if (!sw) sw = await ctx.waitForEvent("serviceworker");
@@ -47,7 +58,7 @@ log("MCP server connected; search_kb allowed"); await shot(page, "03-settings-mc
 await page.getByRole("button", { name: "← Back" }).click();
 
 // --- create session
-await page.getByLabel("Meaningful title").fill("Claims batch KT — Day 1"); await page.getByRole("button", { name: "Create" }).click();
+await newProgrammeAndSession(page, "Claims batch KT");
 await page.waitForSelector("text=Disable session"); log("session created & opened (Active)");
 const sessionsHaveCounts = await page.evaluate(() => /\b\d+\s+(questions|segments|slides|participants|documents)\b/i.test(document.body.innerText));
 if (sessionsHaveCounts) throw new Error("count text found in session UI"); log("no session counts in UI");
