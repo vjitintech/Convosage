@@ -8,6 +8,8 @@ http.createServer((req, res) => {
     let send = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
     if (req.url.includes("/audio/transcriptions")) return send({ text: "The nightly claims batch restarts from the top when CLMV0200 abends.", duration: 10, segments: [{ start: 0.5, end: 4.2, text: "The nightly claims batch restarts from the top", avg_logprob: -0.1, no_speech_prob: 0.01 }, { start: 4.2, end: 9.8, text: "when CLMV0200 abends. Contact ops at ops@example.com.", avg_logprob: -0.2, no_speech_prob: 0.02 }] });
     let body = JSON.parse(raw.toString() || "{}");
+    // Failover test hook: the Anthropic-format endpoint pretends its quota is used up.
+    if (req.url.endsWith("/v1/messages") && raw.toString().includes("FORCE_QUOTA")) { res.writeHead(429, { "content-type": "application/json" }); return res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "This request would exceed your organization's rate limit / credit balance is too low" } })); }
     // Native Gemini generateContent (MODEL_PROVIDER=gemini): x-goog-api-key, contents/parts in, candidates out.
     if (req.url.includes(":generateContent")) {
       if ((req.headers["x-goog-api-key"] || "") === "bad-key") { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } })); }

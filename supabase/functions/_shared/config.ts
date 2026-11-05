@@ -55,5 +55,5 @@ export const config = {
   mcpSecretKey: env("MCP_SECRET_KEY"), // 32+ chars; encrypts MCP auth tokens at rest
 };
 
-export function aiConfigured() { return !!(config.modelApiKey || config.modelProvider === "openai"); }
+export function aiConfigured() { return !!(config.modelApiKey || config.modelProvider === "openai" || (Deno.env.get("AI_FALLBACKS") || "").trim()); }
 export function asrConfigured() { return !!(config.asrApiKey || /localhost|127\.0\.0\.1/.test(config.asrBaseUrl)); }

@@ -237,6 +237,28 @@ Deno.test({ name: "razorpay webhook: signature verified, idempotent, activates s
   assertEquals((await call(C, "GET", "/v1/billing/status")).body.active, true);
 }});
 
+Deno.test({ name: "AI failover: when the primary runs out of quota, the next provider (Ollama) answers", sanitizeResources: false, sanitizeOps: false, fn: async () => {
+  Deno.env.set("AI_FALLBACKS", "ollama"); Deno.env.set("OLLAMA_BASE_URL", "http://127.0.0.1:18100/v1"); Deno.env.set("OLLAMA_API_KEY", "ollama-test"); Deno.env.set("OLLAMA_MODEL", "gpt-oss:120b");
+  try {
+    const { chat, aiProfiles } = await import("../supabase/functions/_shared/model.ts");
+    assertEquals(aiProfiles().map((p) => p.name), ["primary", "ollama"]);
+    const [ws] = await sql()`select id from app.workspaces limit 1`;
+    const r = await chat({ workspaceId: ws.id, actorId: null, prompt: 'FORCE_QUOTA Reply with ONLY this JSON: {"ok":true}', purpose: "failover-test" });
+    assertEquals(r.provider, "ollama");
+    // the exhausted provider rests, so the next call goes straight to the backup
+    const r2 = await chat({ workspaceId: ws.id, actorId: null, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "failover-test" });
+    assertEquals(r2.provider, "ollama");
+    const [a] = await sql()`select count(*)::int as n from app.audit_events where action = 'ai.call' and metadata->>'provider' = 'ollama'`;
+    assert(a.n >= 2);
+  } finally { Deno.env.delete("AI_FALLBACKS"); }
+} });
+
+Deno.test({ name: "AI failover: with no backup configured the original error is reported", sanitizeResources: false, sanitizeOps: false, fn: async () => {
+  const { chat } = await import("../supabase/functions/_shared/model.ts");
+  const [ws] = await sql()`select id from app.workspaces limit 1`;
+  await nodeAssert.rejects(() => chat({ workspaceId: ws.id, actorId: null, prompt: "FORCE_QUOTA hello", purpose: "failover-test" }), /rate limit|quota|credit/i);
+} });
+
 Deno.test({ name: "audit trail is hash-chained and tamper-evident", sanitizeResources: false, sanitizeOps: false, fn: async () => {
   const rows = await sql()`select id, prev_hash, hash from app.audit_events order by id`;
   for (let i = 1; i < rows.length; i++) assertEquals(rows[i].prev_hash, rows[i - 1].hash);

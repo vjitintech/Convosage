@@ -6,7 +6,7 @@ import { authenticate, type AuthUser } from "../_shared/auth.ts";
 import { background, bad, corsHeaders, errorResponse, forbidden, HttpError, json, oneOf, randomToken, rateLimit, readBytes, readJson, Router, sha256Hex, str, text, uuid } from "../_shared/http.ts";
 import { bootstrapUser, checkAiBudget, DEFAULT_CONTEXT, entitlement, requireEntitlement, requireProgramme, requireSession, requireWorkspace } from "../_shared/access.ts";
 import { cancelSubscription, completeMockPayment, createSubscription, providerFor } from "../_shared/billing.ts";
-import { aiError, chat, connectMcp, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
+import { aiError, aiProfiles, chat, chatWithProfile, connectMcp, readFrameWith, encryptSecret, isEnglish, looksEnglish, readFrame, transcribe, translateToEnglish } from "../_shared/model.ts";
 import { ask, generateKnowledge, generateQuestions, inferContext, jaccard, latestContext } from "../_shared/intelligence.ts";
 import { redact } from "../_shared/redact.ts";
 
@@ -38,18 +38,25 @@ r.add("GET", "/v1/diagnostics", async ({ req }) => {
   const [m] = await db()`select workspace_id from app.memberships where user_id = ${u.id} limit 1`;
   const ws = m?.workspace_id as string;
   const out: Record<string, { ok: boolean; detail: string }> = {};
-  const t0 = Date.now();
-  try { const r = await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", maxTokens: 50 }); out.text_model = { ok: /ok/.test(r.text), detail: `${config.modelName} answered in ${Date.now() - t0} ms` }; }
-  catch (e) { out.text_model = { ok: false, detail: aiError(e).message }; }
-  if (config.modelNameLarge !== config.modelName) {
-    try { await chat({ workspaceId: ws, actorId: u.id, prompt: 'Reply with ONLY this JSON: {"ok":true}', purpose: "diagnostics", large: true, maxTokens: 50 }); out.large_model = { ok: true, detail: `${config.modelNameLarge} OK` }; }
-    catch (e) { out.large_model = { ok: false, detail: aiError(e).message }; }
+  // Every configured AI profile is tested on its own (primary first, then the backups used when it runs out).
+  const profiles = aiProfiles(); const okJson = 'Reply with ONLY this JSON: {"ok":true}';
+  // 64×32 white JPEG — checks that a vision model accepts images.
+  const jpg = Uint8Array.from(atob("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgUFBcUFxsbGxsbGyAeICEhISAgICAhISEkJCQqKiokJCQhISQkKCgqKi4vLisrKisvLzIyMjw8OTlGRkhWVmf/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIACAAQAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AAAAAAAAAAAAAAAD/2Q=="), (c) => c.charCodeAt(0));
+  if (!profiles.length) out.text_model = { ok: false, detail: "No AI provider configured (MODEL_API_KEY or AI_FALLBACKS)." };
+  for (const [i, p] of profiles.entries()) {
+    const label = `${p.name} · ${p.provider}`; const t0 = Date.now();
+    const kText = i === 0 ? "text_model" : `Backup ${i} (${label}) — text`, kVis = i === 0 ? "screen_reading" : `Backup ${i} (${label}) — screen`, kLarge = i === 0 ? "large_model" : `Backup ${i} (${label}) — large`;
+    try { const r = await chatWithProfile(p, { workspaceId: ws, actorId: u.id, prompt: okJson, purpose: "diagnostics", maxTokens: 50 }); out[kText] = { ok: /ok/.test(r.text), detail: `${label}: ${p.model} answered in ${Date.now() - t0} ms` }; }
+    catch (e) { out[kText] = { ok: false, detail: aiError(e, p.name).message }; }
+    if (p.modelLarge !== p.model) {
+      try { await chatWithProfile(p, { workspaceId: ws, actorId: u.id, prompt: okJson, purpose: "diagnostics", large: true, maxTokens: 50 }); out[kLarge] = { ok: true, detail: `${label}: ${p.modelLarge} OK` }; }
+      catch (e) { out[kLarge] = { ok: false, detail: aiError(e, p.name).message }; }
+    }
+    if (p.vision) {
+      try { await readFrameWith(p, jpg, ws, u.id); out[kVis] = { ok: true, detail: `${label}: ${p.vision} accepted an image` }; }
+      catch (e) { out[kVis] = { ok: false, detail: aiError(e, p.name + " vision").message }; }
+    } else if (i > 0) out[kVis] = { ok: true, detail: `${label}: no vision model set — screen reading skips this backup` };
   }
-  try {
-    // 64×32 white JPEG — checks that the vision model accepts images.
-    const jpg = Uint8Array.from(atob("/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYwLjMxLjEwMgD/2wBDAAgUFBcUFxsbGxsbGyAeICEhISAgICAhISEkJCQqKiokJCQhISQkKCgqKi4vLisrKisvLzIyMjw8OTlGRkhWVmf/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIACAAQAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AAAAAAAAAAAAAAAD/2Q=="), (c) => c.charCodeAt(0));
-    await readFrame(jpg, ws, u.id); out.screen_reading = { ok: true, detail: `${config.visionModel} accepted an image` };
-  } catch (e) { out.screen_reading = { ok: false, detail: aiError(e, "vision").message }; }
   if (!asrConfigured()) out.speech_to_text = { ok: false, detail: "ASR_BASE_URL / ASR_API_KEY are not set." };
   else {
     try {

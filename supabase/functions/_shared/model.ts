@@ -20,7 +20,9 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
       last = e;
       const st = (e as { status?: number }).status || 0;
       if (st && st < 500 && st !== 429) break;
-      await new Promise((r) => setTimeout(r, (st === 429 ? 5000 : 400) * Math.pow(2, i) + Math.random() * 200));
+      // Out of tokens/credit: don't wait — hand over to the next provider at once. Short rate limits get one quick retry.
+      if (st === 429 && (/quota|credit|exhaust|insufficient|billing|limit.*(day|month)|RESOURCE_EXHAUSTED/i.test(String((e as Error).message)) || i >= 1)) break;
+      await new Promise((r) => setTimeout(r, (st === 429 ? 2000 : 400) * Math.pow(2, i) + Math.random() * 200));
     }
   }
   throw last;
@@ -54,7 +56,7 @@ export function aiError(e: unknown, what = "AI"): HttpError {
 
 // ---------------------------------------------------------------- Google Gemini (native generateContent API)
 // Used with MODEL_PROVIDER=gemini. Works with AI Studio's AQ.… keys (sent as x-goog-api-key).
-const geminiBase = () => config.modelBaseUrl.replace(/\/openai\/?$/, "").replace(/\/$/, "");
+const geminiBase = (P: AiProfile) => P.baseUrl.replace(/\/openai\/?$/, "").replace(/\/$/, "");
 // Gemini accepts an OpenAPI subset for function parameters: drop keys it rejects.
 function geminiSchema(x: unknown): unknown {
   if (Array.isArray(x)) return x.map(geminiSchema);
@@ -66,8 +68,8 @@ function geminiSchema(x: unknown): unknown {
   }
   return o;
 }
-async function geminiGenerate(model: string, body: Record<string, unknown>) {
-  return await withRetry(() => postJSON(`${geminiBase()}/models/${encodeURIComponent(model)}:generateContent`, { "x-goog-api-key": config.modelApiKey }, body));
+async function geminiGenerate(P: AiProfile, model: string, body: Record<string, unknown>) {
+  return await withRetry(() => postJSON(`${geminiBase(P)}/models/${encodeURIComponent(model)}:generateContent`, { "x-goog-api-key": P.apiKey }, body));
 }
 type GPart = { text?: string; thought?: boolean; functionCall?: { name: string; args?: unknown }; inlineData?: { mimeType: string; data: string } };
 function geminiParts(r: Record<string, unknown>): GPart[] {
@@ -143,26 +145,70 @@ async function callMcp(t: McpTool, args: unknown) {
 }
 
 // ---------------------------------------------------------------- chat
+// ---------------------------------------------------------------- AI profiles + automatic failover
+// The primary profile comes from MODEL_*; backups are listed in AI_FALLBACKS (e.g. "groq,ollama,anthropic,gemini").
+// When a provider's quota/tokens run out, its key is rejected, its model is unknown or it keeps failing, the next one is used
+// and the failing one is rested for a while (per server instance).
+export interface AiProfile { name: string; provider: "anthropic" | "openai" | "gemini"; baseUrl: string; apiKey: string; model: string; modelLarge: string; vision: string }
+const E = (k: string, d = "") => (Deno.env.get(k) ?? "").trim() || d;
+const PRESETS: Record<string, () => AiProfile | null> = {
+  anthropic: () => E("ANTHROPIC_API_KEY") ? { name: "anthropic", provider: "anthropic", baseUrl: E("ANTHROPIC_BASE_URL", "https://api.anthropic.com"), apiKey: E("ANTHROPIC_API_KEY"), model: E("ANTHROPIC_MODEL", "claude-haiku-5-5"), modelLarge: E("ANTHROPIC_MODEL_LARGE", E("ANTHROPIC_MODEL", "claude-sonnet-5-5")), vision: E("ANTHROPIC_VISION_MODEL", E("ANTHROPIC_MODEL", "claude-haiku-5-5")) } : null,
+  gemini: () => E("GEMINI_API_KEY") ? { name: "gemini", provider: "gemini", baseUrl: E("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"), apiKey: E("GEMINI_API_KEY"), model: E("GEMINI_MODEL", "gemini-3.5-flash-lite"), modelLarge: E("GEMINI_MODEL_LARGE", "gemini-3.5-flash"), vision: E("GEMINI_VISION_MODEL", E("GEMINI_MODEL", "gemini-3.5-flash-lite")) } : null,
+  groq: () => E("GROQ_API_KEY") ? { name: "groq", provider: "openai", baseUrl: E("GROQ_BASE_URL", "https://api.groq.com/openai/v1"), apiKey: E("GROQ_API_KEY"), model: E("GROQ_MODEL", "openai/gpt-oss-20b"), modelLarge: E("GROQ_MODEL_LARGE", "openai/gpt-oss-120b"), vision: E("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct") } : null,
+  ollama: () => E("OLLAMA_API_KEY") || E("OLLAMA_BASE_URL") ? { name: "ollama", provider: "openai", baseUrl: E("OLLAMA_BASE_URL", "https://ollama.com/v1"), apiKey: E("OLLAMA_API_KEY"), model: E("OLLAMA_MODEL", "gpt-oss:120b"), modelLarge: E("OLLAMA_MODEL_LARGE", E("OLLAMA_MODEL", "gpt-oss:120b")), vision: E("OLLAMA_VISION_MODEL", "") } : null,
+  openai: () => E("OPENAI_API_KEY") ? { name: "openai", provider: "openai", baseUrl: E("OPENAI_BASE_URL", "https://api.openai.com/v1"), apiKey: E("OPENAI_API_KEY"), model: E("OPENAI_MODEL", "gpt-5.4-mini"), modelLarge: E("OPENAI_MODEL_LARGE", E("OPENAI_MODEL", "gpt-5.4-mini")), vision: E("OPENAI_VISION_MODEL", E("OPENAI_MODEL", "gpt-5.4-mini")) } : null,
+};
+export function aiProfiles(): AiProfile[] {
+  const out: AiProfile[] = [];
+  if (config.modelApiKey || config.modelProvider === "openai")
+    out.push({ name: "primary", provider: config.modelProvider, baseUrl: config.modelBaseUrl, apiKey: config.modelApiKey, model: config.modelName, modelLarge: config.modelNameLarge, vision: config.visionModel });
+  for (const n of E("AI_FALLBACKS").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean)) { const p = PRESETS[n]?.(); if (p) out.push(p); }
+  return out;
+}
+const resting = new Map<string, number>(); // profile name -> rest until (ms)
+function shouldFailOver(e: unknown) {
+  const code = (e as HttpError)?.code || ""; const st = (e as { status?: number }).status || 0;
+  return ["ai_rate_limited", "ai_key_rejected", "ai_model_not_found", "ai_failed", "ai_blocked", "model_loop", "model_bad_output"].includes(code) || st === 429 || st >= 500 || st === 401 || st === 403 || st === 404 || !st;
+}
+function restFor(e: unknown) { const code = (e as HttpError)?.code; return code === "ai_rate_limited" ? 10 * 60_000 : code === "ai_key_rejected" || code === "ai_model_not_found" ? 60 * 60_000 : 2 * 60_000; }
+async function withFailover<T>(what: string, fn: (p: AiProfile) => Promise<T>, filter: (p: AiProfile) => boolean = () => true): Promise<T> {
+  const all = aiProfiles().filter(filter);
+  if (!all.length) throw new HttpError(503, "ai_unconfigured", "AI is not configured on the server yet.");
+  const now = Date.now(); const ready = all.filter((p) => (resting.get(p.name) || 0) <= now);
+  const order = ready.length ? ready : all; // everything resting: try them all anyway
+  let last: unknown;
+  for (const p of order) {
+    try { return await fn(p); }
+    catch (e) {
+      last = e; if (!shouldFailOver(e) || order.length === 1) break;
+      resting.set(p.name, Date.now() + restFor(e)); console.warn(`[ai] ${what}: ${p.name} failed (${(e as Error).message?.slice(0, 160)}) — trying next provider`);
+    }
+  }
+  throw last instanceof HttpError && order.length > 1 ? new HttpError(last.status, last.code, `All configured AI providers failed. Last error: ${last.message}`) : last;
+}
+
 export interface ChatResult { text: string; toolsUsed: string[]; model: string; provider: string }
 
-export async function chat(opts: { workspaceId: string; actorId: string | null; prompt: string; large?: boolean; useTools?: boolean; purpose: string; maxTokens?: number }): Promise<ChatResult> {
-  if (!config.modelApiKey && config.modelProvider === "anthropic") throw new HttpError(503, "ai_unconfigured", "AI is not configured on the server yet.");
-  const model = opts.large ? config.modelNameLarge : config.modelName;
+type ChatOpts = { workspaceId: string; actorId: string | null; prompt: string; large?: boolean; useTools?: boolean; purpose: string; maxTokens?: number };
+export async function chat(opts: ChatOpts): Promise<ChatResult> { return await withFailover("chat", (p) => chatWith(p, opts)); }
+export async function chatWithProfile(p: AiProfile, opts: ChatOpts) { return await chatWith(p, opts); }
+async function chatWith(P: AiProfile, opts: ChatOpts): Promise<ChatResult> {
+  const model = opts.large ? P.modelLarge : P.model;
   const tools = opts.useTools ? await loadWorkspaceTools(opts.workspaceId) : [];
   const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
   const used: string[] = []; let calls = 0;
   const audit = async (meta: Record<string, unknown>) => { await sql()`select app.audit(${opts.workspaceId}, ${opts.actorId}, 'ai', ${opts.purpose}, 'ai.call', ${sql().json(meta as never)})`; };
   try {
-    if (config.modelProvider === "anthropic") {
-      const base = config.modelBaseUrl.replace(/\/$/, "");
+    if (P.provider === "anthropic") {
+      const base = P.baseUrl.replace(/\/$/, "");
       const messages: Record<string, unknown>[] = [{ role: "user", content: opts.prompt }];
       for (let step = 0; step < 5; step++) {
         const body: Record<string, unknown> = { model, max_tokens: opts.maxTokens || 3000, system: SYSTEM, messages };
         if (tools.length && calls < config.mcpMaxToolCalls) body.tools = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.schema }));
-        const r = await withRetry(() => postJSON(base + "/v1/messages", { "x-api-key": config.modelApiKey, "anthropic-version": "2023-06-01" }, body));
+        const r = await withRetry(() => postJSON(base + "/v1/messages", { "x-api-key": P.apiKey, "anthropic-version": "2023-06-01" }, body));
         const content = (r.content || []) as { type: string; text?: string; id?: string; name?: string; input?: unknown }[];
         const uses = content.filter((c) => c.type === "tool_use");
-        if (r.stop_reason !== "tool_use" || !uses.length) { const text = content.filter((c) => c.type === "text").map((c) => c.text).join(""); await audit({ purpose: opts.purpose, model, tools: used }); return { text, toolsUsed: used, model, provider: "anthropic" }; }
+        if (r.stop_reason !== "tool_use" || !uses.length) { const text = content.filter((c) => c.type === "text").map((c) => c.text).join(""); await audit({ purpose: opts.purpose, model, provider: P.name, tools: used }); return { text, toolsUsed: used, model, provider: P.name }; }
         messages.push({ role: "assistant", content });
         const results = [];
         for (const u of uses) {
@@ -175,15 +221,15 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
       }
       throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
     }
-    if (config.modelProvider === "gemini") {
+    if (P.provider === "gemini") {
       const contents: Record<string, unknown>[] = [{ role: "user", parts: [{ text: opts.prompt }] }];
       for (let step = 0; step < 5; step++) {
         const body: Record<string, unknown> = { systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: { temperature: 0.2 } };
         if (tools.length && calls < config.mcpMaxToolCalls) body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description.slice(0, 1000), parameters: geminiSchema(t.schema) })) }];
-        const r = await geminiGenerate(model, body);
+        const r = await geminiGenerate(P, model, body);
         const parts = geminiParts(r);
         const fcs = parts.filter((p) => p.functionCall);
-        if (!fcs.length) { const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join(""); await audit({ purpose: opts.purpose, model, tools: used }); return { text, toolsUsed: used, model, provider: "gemini" }; }
+        if (!fcs.length) { const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join(""); await audit({ purpose: opts.purpose, model, provider: P.name, tools: used }); return { text, toolsUsed: used, model, provider: P.name }; }
         contents.push({ role: "model", parts });
         const responses = [];
         for (const p of fcs) {
@@ -197,8 +243,8 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
       throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
     }
     // OpenAI-compatible (OpenAI, Azure OpenAI compatible endpoints, Ollama, vLLM, LM Studio …)
-    const base = config.modelBaseUrl.replace(/\/$/, "");
-    const headers: Record<string, string> = {}; if (config.modelApiKey) headers.authorization = "Bearer " + config.modelApiKey;
+    const base = P.baseUrl.replace(/\/$/, "");
+    const headers: Record<string, string> = {}; if (P.apiKey) headers.authorization = "Bearer " + P.apiKey;
     const messages: Record<string, unknown>[] = [{ role: "system", content: SYSTEM }, { role: "user", content: opts.prompt }];
     for (let step = 0; step < 5; step++) {
       const body: Record<string, unknown> = { model, temperature: 0.2, messages };
@@ -206,7 +252,7 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
       const r = await withRetry(() => postJSON(base + "/chat/completions", headers, body));
       const msg = ((r.choices as { message: Record<string, unknown> }[] | undefined)?.[0]?.message || {}) as { content?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[] };
       const tcs = msg.tool_calls || [];
-      if (!tcs.length) { await audit({ purpose: opts.purpose, model, tools: used }); return { text: msg.content || "", toolsUsed: used, model, provider: "openai" }; }
+      if (!tcs.length) { await audit({ purpose: opts.purpose, model, provider: P.name, tools: used }); return { text: msg.content || "", toolsUsed: used, model, provider: P.name }; }
       messages.push({ role: "assistant", content: msg.content || null, tool_calls: tcs });
       for (const tc of tcs) {
         const t = byName[tc.function?.name]; let args = {}; try { args = JSON.parse(tc.function?.arguments || "{}"); } catch { /* ignore */ }
@@ -217,7 +263,7 @@ export async function chat(opts: { workspaceId: string; actorId: string | null; 
       }
     }
     throw new HttpError(502, "model_loop", "The AI could not finish. Please retry.");
-  } catch (e) { throw aiError(e); } finally {
+  } catch (e) { throw aiError(e, P.name); } finally {
     for (const t of tools) { try { await t.client.close(); } catch { /* ignore */ } }
   }
 }
@@ -308,27 +354,29 @@ ${JSON.stringify(lines)}`;
 // ---------------------------------------------------------------- Vision / OCR
 export interface VisualRead { type: "slide" | "table" | "diagram" | "code" | "screen"; title: string; text: string; confidence: number; language: string }
 export async function readFrame(jpeg: Uint8Array, workspaceId: string, actorId: string | null): Promise<VisualRead> {
-  if (!config.modelApiKey && config.modelProvider === "anthropic") throw new HttpError(503, "ai_unconfigured", "AI is not configured on the server yet.");
+  return await withFailover("vision", (p) => readFrameWith(p, jpeg, workspaceId, actorId), (p) => !!p.vision);
+}
+export async function readFrameWith(P: AiProfile, jpeg: Uint8Array, workspaceId: string, actorId: string | null): Promise<VisualRead> {
   let b64 = ""; const CH = 0x8000; for (let i = 0; i < jpeg.length; i += CH) b64 += String.fromCharCode(...jpeg.subarray(i, i + CH)); b64 = btoa(b64);
   const ask = 'Extract the visible content of this shared-screen frame from a meeting. The screen may be in ANY language: write title and text in ENGLISH (translate if needed; keep code, names and numbers verbatim). Return ONLY JSON: {"type":"slide|table|diagram|code|screen","title":"slide title in English or empty","text":"all readable text in English; tables as Markdown; code verbatim; diagrams as a short description of boxes and arrows","language":"ISO code of the language shown on screen, e.g. en, hi, ja","confidence":0.0}. Ignore meeting-app chrome (toolbars, participant tiles, chat buttons). If nothing meaningful is visible, return type "screen" with empty text.';
   let out = "";
   try {
-  if (config.modelProvider === "gemini") {
-    const r = await geminiGenerate(config.visionModel, { systemInstruction: { parts: [{ text: SYSTEM }] }, generationConfig: { temperature: 0 },
+  if (P.provider === "gemini") {
+    const r = await geminiGenerate(P, P.vision, { systemInstruction: { parts: [{ text: SYSTEM }] }, generationConfig: { temperature: 0 },
       contents: [{ role: "user", parts: [{ inlineData: { mimeType: "image/jpeg", data: b64 } }, { text: ask }] }] });
     out = geminiParts(r).filter((p) => p.text && !p.thought).map((p) => p.text).join("");
-  } else if (config.modelProvider === "anthropic") {
-    const r = await withRetry(() => postJSON(config.modelBaseUrl.replace(/\/$/, "") + "/v1/messages", { "x-api-key": config.modelApiKey, "anthropic-version": "2023-06-01" },
-      { model: config.visionModel, max_tokens: 2000, system: SYSTEM, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } }, { type: "text", text: ask }] }] }));
+  } else if (P.provider === "anthropic") {
+    const r = await withRetry(() => postJSON(P.baseUrl.replace(/\/$/, "") + "/v1/messages", { "x-api-key": P.apiKey, "anthropic-version": "2023-06-01" },
+      { model: P.vision, max_tokens: 2000, system: SYSTEM, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } }, { type: "text", text: ask }] }] }));
     out = ((r.content || []) as { type: string; text?: string }[]).filter((c) => c.type === "text").map((c) => c.text).join("");
   } else {
-    const headers: Record<string, string> = {}; if (config.modelApiKey) headers.authorization = "Bearer " + config.modelApiKey;
-    const r = await withRetry(() => postJSON(config.modelBaseUrl.replace(/\/$/, "") + "/chat/completions", headers,
-      { model: config.visionModel, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64," + b64 } }, { type: "text", text: ask }] }] }));
+    const headers: Record<string, string> = {}; if (P.apiKey) headers.authorization = "Bearer " + P.apiKey;
+    const r = await withRetry(() => postJSON(P.baseUrl.replace(/\/$/, "") + "/chat/completions", headers,
+      { model: P.vision, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64," + b64 } }, { type: "text", text: ask }] }] }));
     out = ((r.choices as { message: { content: string } }[])?.[0]?.message?.content) || "";
   }
-  } catch (e) { throw aiError(e, "vision"); }
-  await sql()`select app.audit(${workspaceId}, ${actorId}, 'ai', 'ocr', 'ai.call', ${sql().json({ purpose: "ocr", model: config.visionModel })})`;
+  } catch (e) { throw aiError(e, P.name + " vision"); }
+  await sql()`select app.audit(${workspaceId}, ${actorId}, 'ai', 'ocr', 'ai.call', ${sql().json({ purpose: "ocr", model: P.vision, provider: P.name })})`;
   const j = parseJSONLoose<Partial<VisualRead>>(out);
   const types = ["slide", "table", "diagram", "code", "screen"];
   return { type: (types.includes(String(j.type)) ? j.type : "screen") as VisualRead["type"], title: String(j.title || "").slice(0, 300), text: String(j.text || "").slice(0, 20000), language: String(j.language || "").slice(0, 12), confidence: Math.max(0, Math.min(1, Number(j.confidence) || 0.5)) };
